@@ -323,6 +323,36 @@ function addLeoAccount(userId, name, cookies, extra = {}) {
   return Number(info.lastInsertRowid);
 }
 
+
+/**
+ * 按 `yfd_u`（小猿 userid）找账号。
+ *
+ * ## 为什么需要它（2026-10-03）
+ *
+ * 老挂 App 会在**每次进 PK 页**时把当前登录态推一份过来（见其 `PkNodeSync`）。
+ * 如果这里每次 `addLeoAccount` 都新建一行，就会出现：
+ *
+ *  - 同一个号在库里堆成 N 条（id=1 / 2 / 3 …）；
+ *  - 而 App 侧把「切子账号」的结果也一起推过来时，**旧行还留着旧身份**，
+ *    于是「库里第一条」可能还是切换前的那个，看起来就是「切换后 pk-node 没跟着切」。
+ *
+ * 所以导入改成 **upsert**：按 `yfd_u` 命中就更新（刷新 cookie），不新建。
+ *
+ * ⚠️ `yfd_u` 存的是**明文**（与 cookies_json 不同，它没加密），可以直接比对。
+ *    `Number()` 两边都过一道，避免 `1066052990` 与 `'1066052990'` 比不中。
+ */
+function findLeoAccountByYfdU(userId, yfdU) {
+  const target = Number(yfdU);
+  if (!Number.isFinite(target) || target <= 0) return null;
+  const rows = get()
+    .prepare('SELECT * FROM leo_accounts WHERE user_id = ?')
+    .all(Number(userId));
+  for (const r of rows) {
+    if (Number(r.yfd_u) === target) return decryptAccountRow(r);
+  }
+  return null;
+}
+
 function updateLeoAccount(id, name, cookies, extra = {}) {
   get()
     .prepare(
@@ -710,6 +740,7 @@ module.exports = {
   chainUsageMap,
   addLeoAccount,
   updateLeoAccount,
+  findLeoAccountByYfdU,
   listLeoAccounts,
   getLeoAccount,
   deleteLeoAccount,

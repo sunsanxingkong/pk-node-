@@ -54,15 +54,33 @@ pkH5.setUserInfoProvider(async (leoAccountId) => {
         };
       }
     }
-    // 兜底：baseUserInfoVO 可能为 null（账号在 PK 侧无资料）→ 不注入则 isLogin=false
-    // 显示「未登录」。故用 cookie 里的 userid 构造最小信息，保证 isLogin 成立。
-    const uid = Number(readCookieFromAccount(acc, 'userid') || 0);
+    // ★★ 兜底链（2026-10-03 重写，修「排行榜没有登录态」）
+    //
+    // ## 症状与真因
+    //
+    // 真机上实测：`pkHome` 返回 200，但 **`baseUserInfoVO` 恒为 null**（这个号在
+    // PK 侧没资料），而 `acc.cookies_json` 里 **`userid` 是空串**。
+    // 于是这条兜底也走不通 → `fetchUserInfo` 返回 null →
+    // **`window.__PK_USER` 根本不注入** → 桥的 `getUserInfo` 回 `{}` →
+    // H5 以为未登录 → 发 `ytkUserId=0` → **排行榜显示无登录态**。
+    // （主页的 `0胜 / 胜率0%` 也是同一个根因：桥的 `getBasicInfo` 回了 `userId:0`。）
+    //
+    // ## 为什么用 `acc.yfd_u` 而不是 cookie
+    //
+    // `leo_accounts.yfd_u` **就是小猿 userid**（`importAccount` 时从 cookie 的 userid
+    // 或 `probe()` 的 `currentUserId` 落库），而且是**明文**、必定有值。
+    // cookie 里的 userid 反而可能是空串（服务端有时不下发）。
+    // 所以顺序改成：库里的 yfd_u → cookie userid → pkHome 回包里的 ytkUserId。
+    const uid = Number(acc.yfd_u)
+      || Number(readCookieFromAccount(acc, 'userid'))
+      || Number((r.json && r.json.ytkUserId) || 0)
+      || 0;
     if (uid) {
-      console.log('[pk-h5] baseUserInfoVO 为空，用 cookie userid 兜底：' + uid);
+      console.log('[pk-h5] baseUserInfoVO 为空，用库里的 yfd_u 兜底：' + uid);
       return {
         userId: uid,
-        nickName: '',
-        nickname: '',
+        nickName: acc.name || '',
+        nickname: acc.name || '',
         avatarUrl: '',
         userPendantUrl: '',
         userTag: r.json && r.json.userTag,

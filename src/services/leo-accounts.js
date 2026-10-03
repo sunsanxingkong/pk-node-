@@ -197,9 +197,25 @@ async function importAccount(o) {
   // 存空值反而会覆盖已有的好值。
   const cookies = jar.toJSON().filter((c) => String(c.value == null ? '' : c.value).length > 0);
   let id;
-  if (existingId) {
-    db.updateLeoAccount(existingId, o.name, cookies, { yfdU: yfdU, grade: grade });
-    id = existingId;
+  // ★ 2026-10-03：除了调用方显式给的 existingId，还要**按 yfd_u 去重**。
+  //
+  // 起因（老挂 App 报「切换子账号后 pk-node 没有跟着切」）：
+  // App 每次进 PK 页都会推一份当前登录态，若每次都 `addLeoAccount` 新建，
+  // 同一个号会堆成多行；而「切子账号」推过来的其实是**同一个 yfd_u**
+  // （切号只改 cookie / userid），于是旧行还留着切换前的身份，
+  // 而 H5 用的那条可能正是旧的 → 看起来就像「没跟着切」。
+  //
+  // 改成：命中同一个 yfd_u 就**更新**（刷新 cookie），不新建。
+  const byYfdU = (!existingId && yfdU)
+    ? db.findLeoAccountByYfdU(o.appUserId, yfdU)
+    : null;
+  const targetId = existingId || (byYfdU ? byYfdU.id : null);
+  if (targetId) {
+    db.updateLeoAccount(targetId, o.name, cookies, { yfdU: yfdU, grade: grade });
+    id = targetId;
+    if (byYfdU && !existingId) {
+      console.log('[leo] 命中已有账号 yfd_u=' + yfdU + ' → 刷新 id=' + id + '（不新建）');
+    }
   } else {
     id = db.addLeoAccount(o.appUserId, o.name, cookies, { yfdU: yfdU, grade: grade });
   }
