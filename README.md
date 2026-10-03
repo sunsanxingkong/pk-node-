@@ -108,7 +108,7 @@ git clone https://github.com/sxd91/pk-node.git && cd pk-node
 > 但别指望它替你挡住 —— **去「管理 → 用户」把 `admin/admin` 改掉才是根本**。
 
 ### 第 2 步 · 登录后台
-浏览器打开 `http://127.0.0.1:8787` → `admin / admin` → **立刻改密**（「管理」页可改）。
+浏览器打开 `http://127.0.0.1:8792` → `admin / admin` → **立刻改密**（「管理」页可改）。
 
 ### 第 3 步 · 导入小猿账号
 「小猿账号」页任选一种（效果一致）：
@@ -774,7 +774,7 @@ sh bin/get-cloudflared.sh
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PK_HOST` | `0.0.0.0` | 监听地址。默认监听所有网卡（本机/局域网都能访问）；设 `127.0.0.1` 则只监听本机，设某块网卡的 IP 则只监听那块 |
-| `PK_PORT` | `8787` | 端口（`start.sh` 会自动避让被占用的端口） |
+| `PK_PORT` | `8792` | 端口（`start.sh` 会自动避让被占用的端口） |
 | `PK_DB` | `data/pk-node.sqlite` | SQLite 路径 |
 | `PK_ADMIN_USER` / `PK_ADMIN_PASS` | `admin` / `admin` | 首次启动写入的管理员 |
 | `PK_MAX_CONCURRENT` | `0`（不限） | 最大并行任务数；`0` = 不限制 |

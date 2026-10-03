@@ -100,7 +100,7 @@ jobs:
           - **Windows**：双击 `start.bat`
           - **Linux / macOS**：`./start.sh`
 
-          然后浏览器打开 `http://127.0.0.1:8787`，默认账号 `admin / admin`。
+          然后浏览器打开 `http://127.0.0.1:8792`，默认账号 `admin / admin`。
 
           ### 需要什么
 

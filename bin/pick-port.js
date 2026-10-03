@@ -5,12 +5,12 @@
 // 所以「端口是否被占」只能靠真正 listen 一次来判断 —— 用 Node 自己试最准。
 //
 // 用法：
-//   node bin/pick-port.js            # 从 8787 开始试，输出可用端口
+//   node bin/pick-port.js            # 从 8792 开始试，输出可用端口
 //   node bin/pick-port.js 9000 9020  # 在 [9000, 9020) 区间里找
 
 const net = require('node:net');
 
-const start = Number(process.argv[2] || 8787);
+const start = Number(process.argv[2] || 8792);
 const end = Number(process.argv[3] || start + 20);
 
 /** 尝试监听某端口；成功则立刻关闭并返回 true。 */

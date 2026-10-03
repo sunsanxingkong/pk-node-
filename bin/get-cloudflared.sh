@@ -43,4 +43,4 @@ fi
 chmod +x "$DEST"
 echo "完成：$("$DEST" --version 2>&1 | head -1)"
 echo "现在可以在网页「穿透」页点启动，或运行："
-echo "  $DEST tunnel --url http://127.0.0.1:8787"
+echo "  $DEST tunnel --url http://127.0.0.1:8792"
