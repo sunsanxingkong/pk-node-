@@ -227,4 +227,31 @@ config.maxConcurrentJobs = envInt('PK_MAX_CONCURRENT', 0);
 config.loginFailMax = envInt('PK_LOGIN_FAIL_MAX', 20);
 config.loginFailWindowMs = envInt('PK_LOGIN_FAIL_WINDOW_MS', 10 * 60 * 1000);
 
+/**
+ * 「App 联动」共享令牌（★ 2026-10-03）。
+ *
+ * ## 作用
+ *
+ * 老挂 App 内置了本服务（跑在 127.0.0.1），需要：
+ *   1. 自动用**管理员账号**登录（免手输 admin/admin）；
+ *   2. 把服务里已登录的**小猿账号**导入 App（给 PK H5 用）。
+ *
+ * 这两件事都要求接口能**拿到明文凭据**，而正常接口是刻意不回的
+ * （`publicLeoAccount` 只回 cookie 名字，不回值）。
+ *
+ * ## 为什么要令牌
+ *
+ * 本服务默认监听 `0.0.0.0`（局域网/公网可达）。上面那两个接口一旦裸奔，
+ * 等于把登录态白送出去。所以：
+ *   - 只在请求头 `X-PK-Link` 等于本令牌时才放行；
+ *   - 令牌**默认随机生成**（每次启动变），只写在 App 私有目录里；
+ *   - 想固定可设 `PK_LINK_TOKEN=<值>`（例如容器化部署时）。
+ *
+ * 随机生成用 `crypto.randomBytes`（Node 内置，无需额外依赖）。
+ */
+config.linkToken = process.env.PK_LINK_TOKEN || require('node:crypto').randomBytes(24).toString('hex');
+
+/** 是否是「随机生成」的令牌（用于启动横幅提示怎么取）。 */
+config.linkTokenIsRandom = !process.env.PK_LINK_TOKEN;
+
 module.exports = { config, PK, DEFAULT_HOST, lanAddresses };

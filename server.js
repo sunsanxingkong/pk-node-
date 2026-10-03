@@ -348,6 +348,9 @@ function needAuth(pathname) {
   // 代理本身不做鉴权，它用 URL 里 leoAccountId 对应账号的 cookie 出站。
   if (pathname === '/api/pk/h5/api' || pathname.startsWith('/api/pk/h5/api/')) return false;
   if (pathname === '/api/pk/h5/diag' || pathname === '/api/pk/h5/decrypt' || pathname === '/api/pk/h5/encrypt') return false;
+  // App 联动接口：**不走会话鉴权**，改由 `X-PK-Link` 令牌自保护
+  // （详见 server.js 里 `/api/link/*` 的注释）。
+  if (pathname === '/api/link/handshake' || pathname === '/api/link/accounts') return false;
   if (pathname.startsWith('/api/')) return true;
   return false;
 }
@@ -419,7 +422,76 @@ async function handleApi(req, res, u, user) {
     return sendJson(res, 403, { ok: false, message: '账号已被管理员禁用' });
   }
 
-  /* ------------------------ 小猿登录（短信 / 密码） ------------------------ */
+  /* ---------------- App 联动（★ 2026-10-03） ----------------
+ *
+ * 老挂 App 内置本服务后，需要两件事（都是「把服务里的凭据交给 App」）：
+ *   1. `GET /api/link/handshake` —— 一次拿全：管理员凭据 + 小猿账号（含 cookie）
+ *      + H5 入口 URL。App 调一次就够了。
+ *   2. `GET /api/link/accounts` —— 只要小猿账号（含 cookie），用于刷新。
+ *
+ * ## 为什么必须带令牌
+ *
+ * 普通接口是**刻意不返回 cookie 值**的（见 `publicLeoAccount`：只回名字）。
+ * 这两个接口会回明文 cookie，等于把登录态交出去 —— 而本服务默认监听
+ * `0.0.0.0`。所以必须校验 `X-PK-Link`（值见 `config.linkToken`，
+ * 默认每次启动随机生成、写在 App 私有目录）。
+ *
+ * ## 账号里为什么要带设备链
+ *
+ * App 侧只拿到「账号 cookie」还不够 —— PK H5 需要 `ks_*` 设备链，
+ * 而登录只下发 `sid`。服务侧的 `jobs.jarOf()` 已经把「账号 + 指定设备链」
+ * 合成过一遍（见 `src/jobs.js`），这里直接复用它，免得 App 再实现一遍。
+ */
+if (p === '/api/link/handshake' || p === '/api/link/accounts') {
+  const token = req.headers['x-pk-link'] || u.searchParams.get('link');
+  if (!token || token !== config.linkToken) {
+    return sendJson(res, 403, { ok: false, message: '联动令牌不对（X-PK-Link）' });
+  }
+  const out = { ok: true, version: 1 };
+
+  if (p === '/api/link/handshake') {
+    // 管理员凭据：让 App 免手输登录。只回**默认管理员**，不回其它用户。
+    out.admin = {
+      username: config.defaultAdminUser,
+      password: config.defaultAdminPass,
+      note: '首次启动写入的默认管理员；改过密码的话 App 侧需重新登录',
+    };
+    out.port = config.port;
+    // H5 入口：App 的 WebView 直接指向它（同源，注入脚本才生效）
+    out.h5Base = 'http://127.0.0.1:' + config.port + '/pk-h5/pk.html';
+  }
+
+  // 小猿账号（含明文 cookie + 已套用设备链）—— App 拿它建本地登录态。
+  //
+  // ⚠️ `jobs.jarOf()` 返回的是 `http.CookieJar` 实例，cookie 在 **`.items`**
+  //    数组里（不是 `toJSON()`）。
+  const admin = db.findUserByName(config.defaultAdminUser);
+  out.accounts = admin
+    ? db.listLeoAccounts(admin.id).map((a) => {
+        const jar = jobs.jarOf(a);              // 已按「账号指定设备链」补齐 ks_*
+        const items = (jar && jar.items) || [];
+        const cookies = items.map((c) => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path,
+        }));
+        return {
+          id: a.id,
+          name: a.name,
+          yfdU: a.yfd_u,
+          grade: a.grade,
+          deviceChainId: a.device_chain_id == null ? null : Number(a.device_chain_id),
+          cookies,
+          cookieHeader: cookies.map((c) => c.name + '=' + c.value).join('; '),
+        };
+      })
+    : [];
+
+  return sendJson(res, 200, out);
+}
+
+/* ------------------------ 小猿登录（短信 / 密码） ------------------------ */
 
   // 这些路由在「小猿账号」页用，属于「往库里加账号」的入口，
   // 与「粘贴 cookie 导入」并列 —— 三条路的落库逻辑完全一致。
@@ -1341,6 +1413,14 @@ function main() {
         (process.platform === 'win32' ? 'set PK_HOST=0.0.0.0 & start.bat' : 'PK_HOST=0.0.0.0 ./start.sh'));
     }
     console.log('[pk-node] 管理后台默认账号：' + config.defaultAdminUser + ' / ' + config.defaultAdminPass + '（请尽快改密）');
+    // ★ App 联动令牌：老挂内置本服务时用它免鉴权取凭据。
+    //   随机生成时提示怎么拿（固定令牌则不必打印，避免日志泄露）。
+    if (config.linkTokenIsRandom) {
+      console.log('[pk-node] 联动令牌（App 用，每次启动随机）：' + config.linkToken);
+      console.log('           固定它：PK_LINK_TOKEN=<自定值> ./start.sh');
+    } else {
+      console.log('[pk-node] 联动令牌：已由 PK_LINK_TOKEN 指定');
+    }
   });
 
   const shutdown = () => {
