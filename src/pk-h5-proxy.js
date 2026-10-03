@@ -1638,10 +1638,37 @@ async function proxyApi(req, res, u, ctx) {
       delete query._appId;
     }
     // 必须同时改 query 与 opts 才能真覆盖：buildUrl 里业务参数（params）优先级最高，
-    // 只改 query 会被冲掉。version/platform/vendor 用 config.js 的 PK.commonQuery。
-    query.version = PK.commonQuery.version;
-    query.platform = PK.commonQuery.platform;
-    query.vendor = PK.commonQuery.vendor;
+    // 只改 query 会被冲掉。
+    //
+    // ★★ 2026-10-03 修正（修「排行榜没有登录态」的真因）：
+    //
+    // 这里**原先对所有人用 `PK.commonQuery`**（version=3.143.1 / platform=android35）。
+    // 那只对 **PK 端点**（`/leo-game-pk`）成立 —— 它的 version 必须是 App 实际版本
+    // （3.143.1），错一个数就 417。
+    //
+    // 但**其余主域端点**（`/leo-activity`、`/leo-star`、`/leo-homework`…）走的是
+    // **另一套校验**，服务端放行的是 **3.140.1 + android37**（见 `config.js` 的
+    // `PK.exercise` 与 README「417 已破」一节）：
+    //
+    //     version=3.141.1   → 417        version=3.140.1   → 200
+    //     platform=android36 → 417       platform=android37 → 200
+    //
+    // 于是「排行榜页」（`/leo-star/api/exercise/rank/list` 等）拿到 PK 那套参数 →
+    // **大面积 417** → 数据拿不到 → 用户说「排行榜看不到」。
+    // 真机日志里 48 次 `daily/award` 有 38 次 417 就是这个原因。
+    //
+    // 现在按端点分表：PK 用 `PK.commonQuery`，其余用 `PK.exercise`。
+    const q = isPk ? PK.commonQuery : PK.exercise;
+    query.version = q.version;
+    query.platform = q.platform;
+    query.vendor = q.vendor;
+    if (!isPk) {
+      // 练习表的 av / webviewVersion / whRatio 也与 PK 不同（真机抓包逐字），一并对齐。
+      if (q.av) query.av = q.av;
+      if (q.webviewVersion) query.webviewVersion = q.webviewVersion;
+      if (q.whRatio) query.whRatio = q.whRatio;
+      if (q.isBackground != null) query.isBackground = q.isBackground;
+    }
     realUrl = leo.buildUrl(pathOnly, query, {
       // PK 与其余主域端点统一走默认 `_productId=611`，且都不带 `_appId`。
       productId: undefined,
