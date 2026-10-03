@@ -63,10 +63,30 @@ const INCLUDE = [
   'package.json',              // server.js 会读 version
   'server.js',                 // 服务入口
   'src',                       // 全部业务模块（含 lre-insns*.js 指令表，共 ~700KB）
+  'public',                    // ★ 管理后台网页（index.html / app.js / style.css）
   'bin/keystream.bin',         // 纯 JS 内容编码器的密钥流（128KB），必需
   'bin/native/lre.so',         // 练习版 sign 模拟的机器码数据（不执行）
   'bin/native/lre_pk.so',      // PK 版 sign 模拟的机器码数据（不执行）
 ];
+
+/**
+ * ★ 2026-10-03 事故：`public` 曾**不在**上面这份清单里。
+ *
+ * 后果（真机症状）：App 里打开「pk-node 管理后台」显示 **「未找到」**。
+ * 链路是 `server.js` 的 `serveStatic()`：
+ *
+ * ```js
+ * const PUBLIC_DIR = path.join(config.root, 'public');   // server.js:25
+ * if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return sendText(res, 404, '未找到');
+ * ```
+ *
+ * 工作区里没有 `public/` → `index.html` 不存在 → 对 `/` 的请求稳定返回
+ * `404 未找到`。**服务本身是好的**（`/api/auth/me` 200、H5 也正常），
+ * 所以只看「服务起没起来」是发现不了的。
+ *
+ * 为什么之前的 `checkRequires()` 没抓到：它只扫 `require('./...')` 的
+ * **JS 模块**依赖 —— 而 `public/` 是**静态资源**，JS 里根本不会 require 它。
+ * 所以这次同时补了一条 `checkStatic()`（见下）专门盯这类漏项。 */
 
 /**
  * 永不入包。
@@ -81,6 +101,34 @@ const INCLUDE = [
 const NEVER = [
   'src/views',                 // 服务端模板（当前为空目录，walk 本就不会产出文件）
 ];
+
+/**
+ * 静态资源门禁：`server.js` 里 `path.join(<任意>, '<名字>')` 形式引用的目录/文件，
+ * 必须在工作区里真的存在。
+ *
+ * 存在的理由就是上面 `public` 那次事故 —— `checkRequires()` 只看 JS 依赖，
+ * 而静态目录（网页 UI！）是它看不见的盲区。
+ */
+const STATIC_DIRS = [
+  'public',                    // serveStatic 的根（管理后台网页）
+];
+
+function checkStatic(files) {
+  const problems = [];
+  const seen = new Set(files);
+  for (const d of STATIC_DIRS) {
+    const present = files.some((f) => f === d || f.startsWith(d + '/'));
+    if (!present) {
+      problems.push('静态目录缺失：' + d + '（server.js 会从这里读文件，缺了就是 404）');
+      continue;
+    }
+    // 目录在还不够 —— `public/index.html` 是 `/` 的入口，缺了照样「未找到」。
+    if (d === 'public' && !seen.has('public/index.html')) {
+      problems.push('缺少 public/index.html —— 访问 / 会直接 404「未找到」');
+    }
+  }
+  return problems;
+}
 
 function walk(rel, out) {
   const abs = path.join(ROOT, rel);
@@ -174,6 +222,15 @@ function main() {
     process.exit(1);
   }
   console.log('  require 链：OK');
+
+  // ★ 2026-10-03 新增：静态资源门禁（`public` 那次事故的补丁）。
+  const staticProblems = checkStatic(files);
+  if (staticProblems.length) {
+    console.error('\n✗ 静态资源不完整（App 上会 404「未找到」）：');
+    for (const p of staticProblems) console.error('  - ' + p);
+    process.exit(1);
+  }
+  console.log('  静态资源：OK');
 
   let raw = 0;
   for (const f of files) raw += fs.statSync(path.join(ROOT, f)).size;
