@@ -1,0 +1,197 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * 导出「内置 node 工作区」zip —— 给 cn.apixiaoyuan.app 的 assets 用。
+ *
+ * ## 用途
+ *
+ * 老挂（cn.apixiaoyuan.app）内置了一份 Android 版 node（`jniLibs/arm64-v8a/libnode.so`），
+ * 在 App 私有目录里跑 **pk-node 本体**，再由 WebView 访问 `http://127.0.0.1:8792`。
+ * 本脚本产出「pk-node 本体」那一份 zip，App 首次启动时解压到 `filesDir/pk-node/`。
+ *
+ * ## 为什么不复用 make-release.js 的 zip
+ *
+ * 那个 zip 是**给人用的免安装包**，含 `start.sh` / `start.bat` / `docs/` / `tools/`
+ * （几十个开发脚本）、还有 37MB 的 `cloudflared` 二进制（其实已被 NEVER 排除）。
+ * 内置到 APK 里只需要**跑服务的最小集**，多了纯属浪费体积与解压时间：
+ *
+ *   | 项 | 免安装包 | 本工作区 |
+ *   |---|---|---|
+ *   | 体积 | ~1.0 MB | ~2.6 MB |
+ *   | 文件数 | 100+ | 26 |
+ *   | 启动脚本 | start.sh/start.bat | 无（App 直接 exec libnode.so） |
+ *   | 文档/工具 | 全带 | 全不带 |
+ *
+ * 说明：体积反而更大是因为免安装包**不含** `lre.so`/`lre_pk.so` 之外的 arm64 库，
+ * 而这里必须带上那两个 0.9MB 的签名数据（纯 JS 模拟器要读它）。
+ *
+ * ## 为什么 bin/native 只放两个 .so
+ *
+ * `lre.so` / `lre_pk.so` 是**纯数据**——被 `src/lre-emu.js` 逐条读机器码做模拟，
+ * **从不执行**。所以它们能安全地放在 App 私有目录（W^X 只限制「执行」，不限制「读」）。
+ * 其余 arm64 库（linker64 / libc.so / libContentEncoder_patched.so …）
+ * 是给 `spawnSync(linker64, …)` 用的，在 App 内既跑不了也不需要（sign 已是纯 JS）。
+ *
+ * ## 用法
+ *
+ * ```sh
+ * node tools/export-app-workspace.js                       # → dist/pk-node-workspace.zip
+ * node tools/export-app-workspace.js --out /path/to/assets # → 指定文件路径
+ * ```
+ */
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+
+const ROOT = path.resolve(__dirname, '..');
+const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+const VERSION = pkg.version;
+
+/** 默认输出路径。 */
+const DEFAULT_OUT = path.join(ROOT, 'dist', 'pk-node-workspace.zip');
+
+/**
+ * 工作区文件清单（相对仓库根）。
+ *
+ * ⚠️ 这份清单必须与 `server.js` 的 require 链对齐 —— 少一个文件，
+ * App 里启动就会 MODULE_NOT_FOUND，而**构建期发现不了**（只有真机才暴露）。
+ * 所以下面有一条「静态检查」：把 `server.js` 里 `require('./...')` 的路径都提取出来，
+ * 逐个确认在工作区里存在。
+ */
+const INCLUDE = [
+  'package.json',              // server.js 会读 version
+  'server.js',                 // 服务入口
+  'src',                       // 全部业务模块（含 lre-insns*.js 指令表，共 ~700KB）
+  'bin/keystream.bin',         // 纯 JS 内容编码器的密钥流（128KB），必需
+  'bin/native/lre.so',         // 练习版 sign 模拟的机器码数据（不执行）
+  'bin/native/lre_pk.so',      // PK 版 sign 模拟的机器码数据（不执行）
+];
+
+/**
+ * 永不入包。
+ *
+ * ⚠️ 这里**不能**写 `src/services` —— 它是 `server.js` 的直接依赖
+ * （auth / leo-accounts / login 三个模块），排除掉 App 里必然 MODULE_NOT_FOUND。
+ * 这个坑正是被下面 `checkRequires()` 抓出来的（第一次跑就在这里报错）。
+ *
+ * 保留的理由：将来若加入 `src/views`（模板）、`src/routes`（无文件）之类
+ * 纯服务端渲染资源，可以在这里显式排除。
+ */
+const NEVER = [
+  'src/views',                 // 服务端模板（当前为空目录，walk 本就不会产出文件）
+];
+
+function walk(rel, out) {
+  const abs = path.join(ROOT, rel);
+  if (!fs.existsSync(abs)) return;
+  const st = fs.statSync(abs);
+  if (st.isDirectory()) {
+    for (const e of fs.readdirSync(abs).sort()) walk(path.join(rel, e), out);
+  } else if (st.isFile()) {
+    out.push(rel.split(path.sep).join('/'));
+  }
+}
+
+function collect() {
+  const files = [];
+  for (const rel of INCLUDE) walk(rel, files);
+  return files.filter((f) => !NEVER.some((n) => f === n || f.startsWith(n + '/')));
+}
+
+/**
+ * 静态检查：`server.js` 里所有相对 require 的目标，必须在工作区清单里存在。
+ *
+ * 这是**构建期**能抓到「漏拷文件」的唯一手段（真机才会暴露 MODULE_NOT_FOUND）。
+ */
+function checkRequires(files) {
+  const problems = [];
+  const seen = new Set(files);
+  const scan = (rel) => {
+    const abs = path.join(ROOT, rel);
+    let src;
+    try { src = fs.readFileSync(abs, 'utf8'); } catch { return; }
+    const re = /require\(['"](\.[^'"]+)['"]\)/g;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const spec = m[1];
+      const resolved = path.posix.normalize(
+        path.posix.join(path.posix.dirname(rel.split(path.sep).join('/')), spec),
+      );
+      // 允许省略 .js / 目录下 index.js（Node 解析规则）
+      const candidates = [resolved, resolved + '.js', resolved + '/index.js', resolved + '.json'];
+      if (!candidates.some((c) => seen.has(c))) {
+        problems.push(rel + ' 需要 ' + spec + '（解析为 ' + candidates.join(' | ') + '）');
+      }
+    }
+  };
+  // 只扫 manifest 内的 js（含 server.js）
+  for (const f of files) if (f.endsWith('.js')) scan(f.replace(/\//g, path.sep));
+  return problems;
+}
+
+function human(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+/** 用 python3 的 zipfile 打包（与 make-release.js 同法，保证确定性、可复现）。 */
+function zip(srcRoot, files, zipPath) {
+  fs.mkdirSync(path.dirname(zipPath), { recursive: true });
+  const py = `
+import os, sys, zipfile
+root, dst = sys.argv[1], sys.argv[2]
+rels = sys.argv[3:]
+with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    for rel in rels:
+        src = os.path.join(root, rel)
+        zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        zi.external_attr = 0o644 << 16
+        with open(src, 'rb') as f:
+            z.writestr(zi, f.read())
+print('zipped', dst)
+`;
+  const r = spawnSync('python3', ['-c', py, srcRoot, zipPath, ...files], { encoding: 'utf8' });
+  if (r.status !== 0) throw new Error('zip 失败：' + (r.stderr || r.stdout));
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  let out = DEFAULT_OUT;
+  const i = argv.indexOf('--out');
+  if (i >= 0 && argv[i + 1]) out = path.resolve(argv[i + 1]);
+
+  const files = collect();
+  console.log('== 内置 node 工作区（pk-node ' + VERSION + '）==');
+  console.log('  文件数：' + files.length);
+
+  const problems = checkRequires(files);
+  if (problems.length) {
+    console.error('\n✗ require 链不完整（App 上会 MODULE_NOT_FOUND）：');
+    for (const p of problems) console.error('  - ' + p);
+    process.exit(1);
+  }
+  console.log('  require 链：OK');
+
+  let raw = 0;
+  for (const f of files) raw += fs.statSync(path.join(ROOT, f)).size;
+  console.log('  原始体积：' + human(raw));
+
+  // 体积门禁：内置到 APK 里，超了会明显拖累包体，必须显式确认。
+  const LIMIT = 5 * 1024 * 1024;
+  if (raw > LIMIT) {
+    console.error('\n✗ 工作区超过 ' + human(LIMIT) + '（' + human(raw) + '）—— 请核实是否误入大文件');
+    process.exit(1);
+  }
+
+  zip(ROOT, files, out);
+  const zsize = fs.statSync(out).size;
+  console.log('  zip   ：' + path.relative(ROOT, out) + '  ' + human(zsize));
+  console.log('\n完成。把它放到 App 的 assets 里：');
+  console.log('  cp ' + path.relative(ROOT, out) +
+    ' /root/cn.apixiaoyuan.app/app/src/main/assets/pk-node-workspace.zip');
+}
+
+main();
