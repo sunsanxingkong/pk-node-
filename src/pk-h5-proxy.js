@@ -1358,6 +1358,43 @@ const H5_INJECT = `(function () {
             return out.join(' / ') || '(none)';
           } catch (e) { return 'err'; }
         })(),
+        // ★ 2026-10-04：**视口 + 溢出诊断**（排行榜 / 结算页「看不见」定位用）。
+        //
+        // 用户提出「是不是界面 UI 比例的问题导致显示不了排行榜」——这条就是取证。
+        //   · vw   = 布局视口宽（CSS px）。手机上应约 394（device-width）；
+        //            若读到 1280，说明 meta viewport 被忽略（WebView 没开 useWideViewPort）。
+        //   · over = 右边界超出视口的可见叶子元素（最多 6 个），
+        //            直接看出是哪块内容排到屏幕外、差多少像素。
+        //
+        // （注意：本段在模板字符串里，注释**不能出现反引号**。）
+        vw: (function () {
+          try {
+            return 'inner=' + window.innerWidth + ' outer=' + window.outerWidth
+              + ' dpr=' + (window.devicePixelRatio || 0).toFixed(2)
+              + ' docW=' + document.documentElement.clientWidth
+              + ' bodyW=' + (document.body ? document.body.scrollWidth : -1)
+              + ' screen=' + screen.width + 'x' + screen.height
+              + ' visual=' + (window.visualViewport ? Math.round(window.visualViewport.width) : -1);
+          } catch (e) { return 'err'; }
+        })(),
+        over: (function () {
+          try {
+            var vwid = window.innerWidth || 1;
+            var out = [];
+            var all3 = document.querySelectorAll('div,span,p,a,button,li,h1,h2,h3,img,canvas');
+            for (var q2 = 0; q2 < all3.length && out.length < 6; q2++) {
+              var el = all3[q2];
+              if (el.children.length) continue;
+              var r3 = el.getBoundingClientRect();
+              if (r3.width < 4 || r3.height < 4) continue;
+              if (r3.right > vwid + 4) {
+                var tx = (el.textContent || '').trim().slice(0, 10) || el.tagName.toLowerCase();
+                out.push(tx + '@' + Math.round(r3.left) + '-' + Math.round(r3.right));
+              }
+            }
+            return out.join(' / ') || '(none)';
+          } catch (e) { return 'err'; }
+        })(),
       });
     } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
   }
