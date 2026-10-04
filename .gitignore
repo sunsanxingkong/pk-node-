@@ -23,3 +23,7 @@ dist/
 *~
 # Worker 部署产物（由 tools/gen-worker-bundle.js 生成，含 2.7MB base64 so）
 deploy/w/
+
+# wrangler 本地缓存（含账号 id / 项目状态，不应入库）
+deploy/pages/.wrangler/
+.wrangler/
