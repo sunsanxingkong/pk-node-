@@ -1,13 +1,15 @@
-# 启动清单（docs/relay.json）· 设计说明
+# 启动清单（deploy/pages/relay.json）· 设计说明
 
-> 本文件故意放在仓库根目录，不放 docs/ —— docs/ 会被 pages.yml 原样发布到公网，
-> 放进去等于把「清单是干什么用的」公开印刷出去。根目录只进 git，不会被服务。
+> 本文件故意放在仓库根目录，**不进静态目录**（`deploy/pages/` 会被原样上传到公网）——
+> 那等于把「清单是干什么用的」公开印刷出去。根目录只进 git，不会被任何主机服务。
 
 ## 它是什么
 
-docs/relay.json 是 App 的**启动前远程清单**：App 在第一次组合 UI 之前读它，
+deploy/pages/relay.json 是 App 的**启动前远程清单**：App 在第一次组合 UI 之前读它，
 决定这次「正常启动」还是「直接退出」。它同时是 App 在**完全无法启动、
 用户又不方便连电脑**时的唯一外部救援通道。
+
+**线上地址**：https://pk-node.pages.dev/relay.json  （Cloudflare Pages）
 
 ## 为什么是静态 JSON 页面
 
@@ -52,27 +54,58 @@ docs/relay.json 是 App 的**启动前远程清单**：App 在第一次组合 UI
 3. **不留可检索的指纹**。README、用户可见 UI、错误信息里都不提这个机制；
    诊断日志只打公开 URL。
 
-## CI 伪装（用户硬性要求）
+## 部署方式（用户要求：用 Cloudflare，不用 GitHub Pages）
 
-**不新增任何 workflow、不新增任何 secret、不新增任何部署步骤。**
+用户原话（2026-10-04）：
 
-复用 pk-node 仓库原有的 docs/ -> GitHub Pages 发布链
-（.github/workflows/pages.yml，用途写的是「项目介绍页」，本来就是公开行为）。
-relay.json 只是 docs/ 里多出来的一个静态文件，CI 日志里就是
-「打包 docs/ -> 部署」，看不出任何异常。
+> 「还是用 cloudflare 部署吧，github 有时候过内访问不了」
 
-这同时满足了「在 cloudflare 上」的意图与现实约束：Actions 里**没有**
-Cloudflare API token（只有 TRIGGER_TOKEN），不可能在 CI 里自动部署 CF Pages。
+说得对：`sxd91.github.io` 在国内时通时不通，而这份清单**只在「打不开 App」时
+才被需要** —— 它在最需要的时候恰恰不能掉链子。所以改用 `pages.dev`。
 
-### 要迁到 Cloudflare Pages 时
+### 为什么搭在现有的 `pk-node` Pages 项目里
 
-在 Cloudflare Dashboard（Git 集成）把本仓库接上：Build command 留空，
-Build output directory 填 docs。因为 docs/ 已是纯静态文件，产物就是它本身，
-所以用 GitHub Pages 还是 CF Pages，**App 侧不用改代码**，只换
-LaunchManifest.MANIFEST_URL 即可。
+同账号下已有 `pk-node.pages.dev`（里面有一条代理 function：`/*` 转发到 Worker，
+就是为绕开国内对 `workers.dev` 的阻断而加的）。
+把清单放进**同一个项目**，好处：
 
-（也可以把 docs/relay.json 原样贴到一个新的 CF Pages 项目里只放这一个文件；
-本文不写具体 project 名，避免留下关联。）
+- 不新建项目（少一个可被关联的点）；
+- 同样是改一个静态文件，无需构建；
+- `pages.dev` 国内可达性已验证。
+
+### 与代理 function 的隔离（重要）
+
+`deploy/pages/_routes.json` 里把本文件**排除**在 function 之外：
+
+```json
+{ "version": 1, "include": ["/*"], "exclude": ["/relay.json"] }
+```
+
+否则它会被 function 转发到 Worker（那样就变成「一个能返回指令的端点」了，
+而且多一跳）。部署后实测两条都正常：
+
+- `https://pk-node.pages.dev/relay.json` → 200，直出 JSON
+- `https://pk-node.pages.dev/`            → 200，仍是管理后台
+
+### 怎么改（维护就是跑这一条命令）
+
+```sh
+export CLOUDFLARE_API_TOKEN=<令牌>
+export CLOUDFLARE_ACCOUNT_ID=13182625f8c268f652dca7e33d52ed52
+cd deploy/pages && wrangler pages deploy . --project-name=pk-node --branch=main
+```
+
+**不新增任何 workflow**（所以 CI 日志里看不出异常）；
+本文不写令牌本身（令牌只在本地环境变量里）。
+
+> 注意：Pages 的每次部署都是「整个目录的快照」——
+> 所以 `functions/[[path]].js` 必须**一起上传**，否则会把代理 function 冲掉。
+> 用上面那条命令（cwd = `deploy/pages`）就是完整包，不会丢。
+
+### 想换成 GitHub Pages 也行
+
+早期版本曾搭在 GitHub Pages（`docs/relay.json`，那份还在，内容相同）。
+App 侧换地址**只改一行** `LaunchManifest.MANIFEST_URL`。
 
 ## 代码位置（App 仓库，私有）
 
@@ -85,5 +118,5 @@ LaunchManifest.MANIFEST_URL 即可。
 ## 维护提醒
 
 - 改 relay.json 就是改「开关」，改完推 main 即可，不用发版；
-- App 读的是 docs/ 发布后的**公网 URL**（GitHub Pages），不是 raw 文件；
+- App 读的是部署后的**公网 URL**（当前：https://pk-node.pages.dev/relay.json），不是 raw 文件；
 - 若长时间不用，把 relay 字段删掉即可 —— 字段缺省 = 正常运行。
