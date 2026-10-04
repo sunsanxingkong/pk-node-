@@ -1278,6 +1278,45 @@ const H5_INJECT = `(function () {
   /** 回传当前界面结构（供无头环境判断「该点什么」）。 */
   function pkBotDumpDom(tag) {
     try {
+      // ★ 2026-10-04：**视口单独上报**（kind = bot-vp），不混在 bot-dom 里。
+      //
+      // 原因：服务端对 diag 正文有 txt.slice(0, 1500) 的长度上限（server.js），
+      // 而 bot-dom 的 texts / ls 字段很长，会把排在末尾的字段整段切掉
+      // （实测 vw/over 上报上来是 undefined）。所以关键诊断必须单独发一条。
+      //
+      // （注意：本段在模板字符串里，注释**不能出现反引号**。）
+      diag('bot-vp', {
+        tag: tag,
+        url: location.pathname,
+        // 布局视口宽（CSS px）：手机应约 394；读到 1280 = meta viewport 被忽略。
+        // inner/outer = window 宽；docW/bodyW = 文档宽；dpr = 设备像素比；
+        // screen = 物理屏宽；visual = 可视化视口宽。
+        vw: 'inner=' + window.innerWidth + ' outer=' + window.outerWidth
+          + ' dpr=' + (window.devicePixelRatio || 0).toFixed(2)
+          + ' docW=' + document.documentElement.clientWidth
+          + ' bodyW=' + (document.body ? document.body.scrollWidth : -1)
+          + ' screen=' + screen.width + 'x' + screen.height
+          + ' visual=' + (window.visualViewport ? Math.round(window.visualViewport.width) : -1),
+        // 右边界超出视口的可见叶子元素（最多 6 个）：定位「哪块内容排到屏幕外」。
+        over: (function () {
+          try {
+            var vwid = window.innerWidth || 1;
+            var out = [];
+            var els = document.querySelectorAll('div,span,p,a,button,li,h1,h2,h3,img,canvas');
+            for (var q = 0; q < els.length && out.length < 6; q++) {
+              var el = els[q];
+              if (el.children.length) continue;
+              var r = el.getBoundingClientRect();
+              if (r.width < 4 || r.height < 4) continue;
+              if (r.right > vwid + 4) {
+                var tx = (el.textContent || '').trim().slice(0, 10) || el.tagName.toLowerCase();
+                out.push(tx + '@' + Math.round(r.left) + '-' + Math.round(r.right));
+              }
+            }
+            return out.join(' / ') || '(none)';
+          } catch (e) { return 'err'; }
+        })(),
+      });
       var cvs = document.querySelectorAll('canvas');
       var info = [];
       for (var i = 0; i < cvs.length && i < 3; i++) {
@@ -1354,43 +1393,6 @@ const H5_INJECT = `(function () {
               var t2 = (all2[q].textContent || '').trim();
               if (!t2 || t2.length > 30) continue;
               if (t2.indexOf('赞') >= 0 || t2.indexOf('undefined') >= 0) out.push(t2);
-            }
-            return out.join(' / ') || '(none)';
-          } catch (e) { return 'err'; }
-        })(),
-        // ★ 2026-10-04：**视口 + 溢出诊断**（排行榜 / 结算页「看不见」定位用）。
-        //
-        // 用户提出「是不是界面 UI 比例的问题导致显示不了排行榜」——这条就是取证。
-        //   · vw   = 布局视口宽（CSS px）。手机上应约 394（device-width）；
-        //            若读到 1280，说明 meta viewport 被忽略（WebView 没开 useWideViewPort）。
-        //   · over = 右边界超出视口的可见叶子元素（最多 6 个），
-        //            直接看出是哪块内容排到屏幕外、差多少像素。
-        //
-        // （注意：本段在模板字符串里，注释**不能出现反引号**。）
-        vw: (function () {
-          try {
-            return 'inner=' + window.innerWidth + ' outer=' + window.outerWidth
-              + ' dpr=' + (window.devicePixelRatio || 0).toFixed(2)
-              + ' docW=' + document.documentElement.clientWidth
-              + ' bodyW=' + (document.body ? document.body.scrollWidth : -1)
-              + ' screen=' + screen.width + 'x' + screen.height
-              + ' visual=' + (window.visualViewport ? Math.round(window.visualViewport.width) : -1);
-          } catch (e) { return 'err'; }
-        })(),
-        over: (function () {
-          try {
-            var vwid = window.innerWidth || 1;
-            var out = [];
-            var all3 = document.querySelectorAll('div,span,p,a,button,li,h1,h2,h3,img,canvas');
-            for (var q2 = 0; q2 < all3.length && out.length < 6; q2++) {
-              var el = all3[q2];
-              if (el.children.length) continue;
-              var r3 = el.getBoundingClientRect();
-              if (r3.width < 4 || r3.height < 4) continue;
-              if (r3.right > vwid + 4) {
-                var tx = (el.textContent || '').trim().slice(0, 10) || el.tagName.toLowerCase();
-                out.push(tx + '@' + Math.round(r3.left) + '-' + Math.round(r3.right));
-              }
             }
             return out.join(' / ') || '(none)';
           } catch (e) { return 'err'; }
