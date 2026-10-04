@@ -137,6 +137,41 @@ const H5_INJECT = `(function () {
   // 稳定的伪设备 id：同一会话内必须一致，否则 H5 反复重渲染（界面抖/闪）。
   var DEVICE_ID = 'pknode-' + Math.random().toString(36).slice(2, 10);
 
+  /* ★ 2026-10-04：设备身份（YFD_U）改用「宿主注入的真值」。
+     leo-web-study-group（荣誉榜/排行榜）取身份的链路是
+       location.search 的 YFD_U → cookie(deviceId/YFD_U) → **随机生成**；
+     而 App 容器每次加载都清 127.0.0.1 的 cookie，于是必然落到随机分支 →
+     身份不稳定 → 服务端认不出 → 排行榜「没有登录态」。
+     这里：① 若 URL 没带 YFD_U 就补上；② 把真值固化进 cookie；③ 轮询挡掉 H5 的随机覆盖。 */
+  (function patchDeviceIdentity() {
+    try {
+      var did = window.__PK_DEVICE_ID || DEVICE_ID;
+      var uid = window.__PK_UID || '';
+      function setCk(k, v) {
+        try { document.cookie = encodeURIComponent(k) + '=' + encodeURIComponent(String(v)) + '; path=/'; } catch (e) {}
+      }
+      // ① URL 补 YFD_U（H5 的第一优先来源）
+      try {
+        var q = location.search || '';
+        if (q.indexOf('YFD_U=') < 0 && q.indexOf('_deviceId=') < 0) {
+          var nu = location.pathname + q + (q ? '&' : '?') + 'YFD_U=' + encodeURIComponent(did) + (location.hash || '');
+          history.replaceState(null, '', nu);
+        }
+      } catch (e) {}
+      // ② 固化 cookie
+      setCk('YFD_U', did);
+      setCk('deviceId', did);
+      if (uid) setCk('userid', uid);
+      // ③ 轮询纠正（H5 写入随机值后改回来）
+      var n = 0;
+      var it = setInterval(function () {
+        if (++n > 30) { clearInterval(it); return; }
+        var m = String(document.cookie || '').match(/(?:^|;\s*)YFD_U=([^;]*)/);
+        if (!m || decodeURIComponent(m[1]) !== String(did)) setCk('YFD_U', did);
+      }, 1000);
+    } catch (e) {}
+  })();
+
   /* 伪装成小猿 App 的 WebView UA：H5 靠 UA 是否含 "YuanSouTiKouSuan" 判断是否 App 内，
      决定 8人PK/巅峰赛等入口是否渲染。只追加不替换。 */
   (function patchUserAgent() {
@@ -528,7 +563,9 @@ const H5_INJECT = `(function () {
       loading: function () { return 'OK'; },
       setOnVisibilityChange: function () { return 'OK'; },
       jsLoadComplete: function () { return 'OK'; },
-      getImmerseStatusBarHeight: function () { return 0; },
+      // ★ 2026-10-04：状态栏高度改为**由宿主传入**（window.__PK_SBH），不再恒回 0。
+      //   H5 用它给抬头留出「沉浸式状态栏」的空间；回 0 会让抬头顶到状态栏下面。
+      getImmerseStatusBarHeight: function () { return Number(window.__PK_SBH) || 0; },
       getDeviceInfo: function () { return { platform: 'android', appVersion: BRIDGE_VERSION }; },
       // H5 头像/胜场/昵称首选来源；必须返回真实 userId，否则 isLogin 恒 false →
       // pk-legacy 弹「登录后开始PK」并 location.reload() 死循环。数据由 Node 注入 window.__PK_USER。
@@ -572,6 +609,16 @@ const H5_INJECT = `(function () {
         return { isVip: false, isSVip: false, isStudyGroup: false, studyGroupRightType: 0 };
       },
       getVipRightInfo: function () { return {}; },
+      /* ★ 2026-10-04 照「App 曾跑通的原生桥」补齐（cn.apixiaoyuan.app 的 PkWebViewBridge.kt）。
+         这几个方法 H5 会调，缺了就是桥缺失 → 页面某些控件不出来。 */
+
+      // 能力白名单（H5 侧「不实现也不影响主流程」）—— Kotlin 桥回空数组。
+      getNativeCommandList: function () { return []; },
+      // 页面加载完成通知（pk-legacy 用它收尾初始化）。无返回值，回 OK。
+      loadFinish: function () { return 'OK'; },
+      // 结算页/主页可能调的两个「无返回值」能力（Kotlin 桥有，此处补齐防 bridge-miss）。
+      addFrogBatch: function () { return 'OK'; },
+      setOnInteractivePopped: function () { return 'OK'; },
       sendEventToNative: function () { return 'OK'; },     // 埋点上报
       addMergeableKlog: function () { return 'OK'; },      // 客户端日志
       addFunctionRecord: function () { return 'OK'; },
@@ -1297,6 +1344,13 @@ function rewriteHtml(html, opts) {
   const leoId = opts && opts.leoAccountId != null ? String(opts.leoAccountId) : '';
   // 真实用户信息（喂给桥的 getUserInfo）。
   const user = (opts && opts.user) || null;
+  // ★ 真设备身份（YFD_U）：优先宿主显式传的，其次按账号从设备链取。
+  const deviceId = (opts && opts.deviceId)
+    || (() => {
+      const id = Number(leoId);
+      if (!id || !fetchDeviceId) return '';
+      try { return fetchDeviceId(id) || ''; } catch (e) { return ''; }
+    })();
 
   // 0) 提前注入 leoAccountId 与「跳过新手引导」标记（hook 与主脚本之前执行）。
   //    oral-pk-guide 预置为明文 'true' → showGuide=false → 浮层不弹（presetStorage 会编码）。
@@ -1308,6 +1362,29 @@ function rewriteHtml(html, opts) {
     // 年级单独暴露一份，供 getExerciseInfo/getExerciseConfig 等能力桥使用。
     user && user.gradeId
       ? '<script>window.__PK_GRADE=' + JSON.stringify(Number(user.gradeId) || 0) + ';</script>'
+      : '',
+    // ★ 2026-10-04：把**宿主的状态栏高度**（px）告诉 H5。
+    //
+    // 桥的 getImmerseStatusBarHeight 长期硬编码回 0 → H5 以为「沉浸式高度 = 0」，
+    // 自己的抬头就不会让开状态栏 → **界面顶到状态栏下面**（用户报「界面有问题」）。
+    //
+    // 宿主（App）在 URL 上带 `&sbh=<px>` 传进来（见 rewriteHtml 的 opts.sbh），
+    // 没有就退回 0（浏览器里跑时确实没有状态栏占位）。
+    Number(opts && opts.sbh) > 0
+      ? '<script>window.__PK_SBH=' + JSON.stringify(Number(opts.sbh)) + ';</script>'
+      : '',
+    // ★ 2026-10-04：**真设备身份**（YFD_U）。
+    //
+    // leo-web-study-group（荣誉榜/排行榜）的 `N()` 取身份优先顺序是
+    //   URL 参数 → cookie(deviceId/YFD_U) → 随机生成
+    // App 容器每次加载都清 127.0.0.1 的 cookie，于是只能随机生成 → 身份不稳定 →
+    // 「排行榜没有登录态」。这里把账号设备链里的真值传进去，H5_INJECT 用它
+    // 做 cookie shim + 挡掉随机生成。
+    deviceId ? '<script>window.__PK_DEVICE_ID=' + JSON.stringify(String(deviceId)) + ';</script>' : '',
+    // ★ 2026-10-04：**真用户 ID**（小猿 userid）。
+    // 个别 H5 包（荣誉榜）读 cookie 的 `userid` 而不是走桥的 getUserInfo。
+    user && user.userId
+      ? '<script>window.__PK_UID=' + JSON.stringify(String(user.userId)) + ';</script>'
       : '',
   ].join('');
 
@@ -1350,6 +1427,38 @@ let fetchUserInfo = null;
  *  而用户从后退/历史/刷新进来时常没这个参数 → 显示「未登录」，故记住最后一个兜底。 */
 let lastLeoAccountId = null;
 function setUserInfoProvider(fn) { fetchUserInfo = fn; }
+
+/**
+ * 注册「取设备身份」的提供者（server.js 启动时注入）。
+ *
+ * # 为什么需要它（2026-10-04，用户报「桥开的页面 cookie 传递不对等」）
+ *
+ * `leo-web-study-group`（荣誉榜/排行榜那个 H5 包）取身份的链路是：
+ *
+ * ```js
+ * function N(){
+ *   var t = location.search.match(/(_deviceId|YFD_U)=([^&]+)/);   // ① URL 参数
+ *   if (t) { y('YFD_U', t[2]); return decodeURIComponent(t[2]); }
+ *   var e = v('deviceId') || v('YFD_U');                          // ② cookie
+ *   return e || (e = Date.now()+'-'+Math.random()…, y('YFD_U', e), e); // ③ 随机生成
+ * }
+ * ```
+ *
+ * 而 `YFD_U` 在小猿体系里是**设备指纹派生值**（不是用户 id，见记忆 #8）。
+ *
+ * 在 pk-node 的管理后台（iframe，同源 127.0.0.1）里，H5 至少能走 ② 拿到
+ * 「曾经写入过的」cookie；而在 App 容器里 `clearHostCookies()` 每次加载都会
+ * 把 127.0.0.1 的 cookie 清空 → 只能走 ③ 随机生成 → **每次身份都不一样** →
+ * 服务端拿不到稳定设备指纹 → 排行榜/荣誉榜「没有登录态」。
+ *
+ * 所以这里按 `leoAccountId` 把**该账号设备链里的真 YFD_U / deviceId** 取出来
+ * （优先库里的 `acc.yfd_u`，再退到 cookie 链），交给 rewriteHtml 注入
+ * `window.__PK_DEVICE_ID`，由 H5_INJECT 做 cookie shim + 同名 setter 兜底。
+ *
+ * @type {?function(number): string}
+ */
+let fetchDeviceId = null;
+function setDeviceIdProvider(fn) { fetchDeviceId = fn; }
 
 /** 调试用：match/v2 原始响应只 dump 一次。 */
 let dumpCount = 0;
@@ -1447,7 +1556,13 @@ async function serve(req, res, u) {
       try { user = await fetchUserInfo(Number(leoId)); }
       catch (e) { console.log('[pk-h5] fetchUserInfo 失败：' + e.message); }
     }
-    body = rewriteHtml(body, { leoAccountId: leoId, user });
+    body = rewriteHtml(body, {
+      leoAccountId: leoId,
+      user,
+      // ★ 2026-10-04：把宿主的状态栏高度（px）透传给 H5 —— URL 上的 `sbh`。
+      //   桥的 getImmerseStatusBarHeight 用它给抬头留位（回 0 会让界面顶到状态栏下）。
+      sbh: u.searchParams.get('sbh'),
+    });
     contentType = 'text/html';
   } else if (cdnUrl.endsWith('.js') || contentType.indexOf('javascript') >= 0) {
     // 资产级改写：破解「本地调试环境禁用原生桥」的门禁
@@ -1793,6 +1908,7 @@ module.exports = {
   serve,
   proxyApi,
   setUserInfoProvider,
+  setDeviceIdProvider,
   // 频控重试判定（tools/test-pk-h5-bot.js 会直接断言它）
   pkIsMatchPath,
   pkRetryBudget,

@@ -106,6 +106,45 @@ function readCookieFromAccount(acc, name) {
   return '';
 }
 
+/**
+ * 给 PK H5 代理注册「取设备身份（YFD_U）」的实现。
+ *
+ * # 为什么需要（2026-10-04，用户报「桥开的页面 cookie 传递不对等」）
+ *
+ * `leo-web-study-group`（荣誉榜/排行榜那个 H5 包）取身份的链路是
+ *   URL 的 `YFD_U` → cookie 的 `deviceId`/`YFD_U` → **随机生成**
+ * 而 App 容器每次加载都清 `127.0.0.1` 的 cookie → 必然随机 → 身份不稳定 →
+ * 服务端认不出 → 排行榜「没有登录态」。
+ *
+ * 这里按 `leoAccountId` 给出**稳定**的身份：
+ *   ① `ks_deviceid`（设备链主键，形如 `350266477`）—— 账号 cookie 或绑定的设备链里必定有；
+ *   ② 退到 cookie 的 `YFD_U` / `deviceId`；
+ *   ③ 再退到库里的 `yfd_u`（小猿 userid，也是稳定值）。
+ *
+ * 返回的是**字符串**，注入成 `window.__PK_DEVICE_ID`，由 H5_INJECT 固化进 cookie。
+ */
+pkH5.setDeviceIdProvider((leoAccountId) => {
+  try {
+    const acc = db.getLeoAccount(leoAccountId);
+    if (!acc) return '';
+    const fromCookie = readCookieFromAccount(acc, 'ks_deviceid')
+      || readCookieFromAccount(acc, 'YFD_U')
+      || readCookieFromAccount(acc, 'deviceId');
+    if (fromCookie) return String(fromCookie);
+    // 绑定设备链里的 ks_deviceid
+    try {
+      const jobs = require('./src/jobs');
+      const jar = jobs.jarOf(acc);
+      const v = jar.get('ks_deviceid');
+      if (v) return String(v);
+    } catch (e) { /* ignore */ }
+    return acc.yfd_u ? String(acc.yfd_u) : '';
+  } catch (e) {
+    console.log('[pk-h5] 取设备身份失败：' + e.message);
+    return '';
+  }
+});
+
 /* ---------------------------- 通用工具 ---------------------------- */
 
 /** 读 JSON body（限制大小，避免被塞爆内存）。 */
