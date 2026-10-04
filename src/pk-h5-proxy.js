@@ -450,6 +450,26 @@ const H5_INJECT = `(function () {
       if (did && u.indexOf('YFD_U=') < 0 && u.indexOf('_deviceId=') < 0) {
         add.push('YFD_U=' + encodeURIComponent(did));
       }
+      // ★ 2026-10-04：sbh（状态栏高度）也要带上。（注意：本段在模板字符串里，注释不能出现反引号。）
+      //
+      // # 为什么要带（真机实测发现的缺陷）
+      //
+      // H5 拿到 sbh 后会把它渲染进 .status-bar 的 height（沉浸式抬头留白）。
+      // 而 sbh 原先**只挂在入口 URL** 上（App 的 h5Url 拼的），H5 内部跳转时
+      // addLeoId 不补它 → 下级页（荣誉榜 / 收到的赞 / 对局 / 结算）拿到的 sbh=0
+      // → .status-bar { height: 0px } → **顶部被系统状态栏压住**。
+      //
+      // 真机证据（荣誉榜页面 HTML）：
+      //   <div class="status-bar" style="height: 0px; background: transparent;">
+      //   <div class="nav-bar-placeholder" style="height: 50px;">
+      // 即页面确实按 sbh 排版，只是值是 0。
+      //
+      // 和 pkbot / YFD_U 完全同类的「只挂入口、跳转丢失」问题，一并补上。
+      var sbh = '';
+      try { sbh = String(window.__PK_SBH || ''); } catch (e) { /* ignore */ }
+      if (sbh && u.indexOf('sbh=') < 0) {
+        add.push('sbh=' + encodeURIComponent(sbh));
+      }
       if (!add.length) return u;
       var hashIdx = u.indexOf('#');
       var hash = hashIdx >= 0 ? u.slice(hashIdx) : '';
@@ -1542,8 +1562,15 @@ function rewriteHtml(html, opts) {
     //
     // 宿主（App）在 URL 上带 `&sbh=<px>` 传进来（见 rewriteHtml 的 opts.sbh），
     // 没有就退回 0（浏览器里跑时确实没有状态栏占位）。
+    //
+    // ⭐ 2026-10-04 补：除了注入 `window.__PK_SBH`，还要**落进 cookie**。
+    //   `openWebView` 的 `addLeoId()` 会把 `__PK_SBH` 带进跳转 URL
+    //   （修「下级页 sbh 丢失 → 顶部被状态栏压住」），而**不经过 addLeoId 的原生导航**
+    //   （H5 直接 `location.href = ...`）拿不到 URL 参数 ——
+    //   这时由后端在收到请求时**从 cookie 回填** sbh（见 serve 里读 cookie 的分支）。
     Number(opts && opts.sbh) > 0
-      ? '<script>window.__PK_SBH=' + JSON.stringify(Number(opts.sbh)) + ';</script>'
+      ? '<script>window.__PK_SBH=' + JSON.stringify(Number(opts.sbh)) + ';</script>' +
+        '<script>try{document.cookie="pk_sbh="+' + JSON.stringify(Number(opts.sbh)) + '+\';path=/\';}catch(e){}</script>'
       : '',
     // ★ 2026-10-04：**真设备身份**（YFD_U）。
     //
@@ -1733,7 +1760,14 @@ async function serve(req, res, u) {
       user,
       // ★ 2026-10-04：把宿主的状态栏高度（px）透传给 H5 —— URL 上的 `sbh`。
       //   桥的 getImmerseStatusBarHeight 用它给抬头留位（回 0 会让界面顶到状态栏下）。
-      sbh: u.searchParams.get('sbh'),
+      //
+      // ⭐ 补：URL 上没有时**从 cookie 回填**（`pk_sbh`）。
+      //   为什么需要这层兜底：`sbh` 只挂在入口 URL 上，H5 内部跳转由
+      //   `addLeoId()` 补（已加），但**不经过 addLeoId 的原生导航**
+      //   （H5 直接 `location.href=…`）就丢了 —— 那种情况下页面 sbh=0，
+      //   `.status-bar` 高度为 0 → 顶部被系统状态栏压住（真机实测过）。
+      //   cookie 是**跨页面持续**的，正好补这个缺口。
+      sbh: u.searchParams.get('sbh') || cookieValue(req, 'pk_sbh'),
       // ★ 2026-10-04：告诉 H5「跑在 App 容器里」—— 决定 closeWebView 的返回语义。
       inApp: u.searchParams.get('__pkInApp'),
     });
@@ -1758,6 +1792,25 @@ async function serve(req, res, u) {
 
 /** 服务端日志小工具（解密/代理的可观测性）。 */
 function diagLog(tag, msg) { console.log('[pk-h5:' + tag + '] ' + msg); }
+
+/**
+ * 读一个 cookie 值（从请求头解析）。
+ *
+ * 用途见 `rewriteHtml` 的 `sbh` 那段：URL 上没带 `sbh` 时从 `pk_sbh` cookie 回填。
+ *
+ * @returns {string} 值（没找到回空串）
+ */
+function cookieValue(req, name) {
+  try {
+    var raw = String((req && req.headers && req.headers.cookie) || '');
+    var parts = raw.split(';');
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i].trim();
+      if (t.indexOf(name + '=') === 0) return decodeURIComponent(t.slice(name.length + 1));
+    }
+  } catch (e) { /* ignore */ }
+  return '';
+}
 
 /* ------------------------------ 响应解密 ------------------------------ */
 
