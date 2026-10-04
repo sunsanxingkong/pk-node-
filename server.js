@@ -818,7 +818,10 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
       req.on('error', () => resolve(''));
     });
     const leoId = u.searchParams.get('leoAccountId') || '';
-    console.log('[pk-h5-diag] leo=' + leoId + ' ' + txt.slice(0, 1500));
+    // ★ 2026-10-04：上限从 1500 提到 8000。
+    //   1500 会把长诊断（bot-dom 的 texts / ls 字段很长）排在末尾的字段整段切掉，
+    //   导致上报上来是 undefined —— 排查时白忙一轮。诊断是排障用的，宁可多打。
+    console.log('[pk-h5-diag] leo=' + leoId + ' ' + txt.slice(0, 8000));
     res.writeHead(204, { 'Access-Control-Allow-Origin': '*' });
     res.end();
     return;
