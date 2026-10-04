@@ -27,3 +27,6 @@ deploy/w/
 # wrangler 本地缓存（含账号 id / 项目状态，不应入库）
 deploy/pages/.wrangler/
 .wrangler/
+
+# 站点配置文件（部署产物，由 wrangler 上传）
+deploy/pages/site.json
