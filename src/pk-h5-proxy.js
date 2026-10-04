@@ -1317,6 +1317,58 @@ const H5_INJECT = `(function () {
           } catch (e) { return 'err'; }
         })(),
       });
+      // ★ 2026-10-04：**「谁盖住了内容」定向诊断**。
+      //
+      // 用于 like-list（收到的赞）在 App 里整片空白、但 DOM 里条目明明存在的情况。
+      // 直接问「屏幕正中央是哪个元素」—— 若答案不是列表条目本身，
+      // 那就是有个覆盖层，把它连同 background / opacity / z-index 一起报上来。
+      diag('bot-hit', {
+        tag: tag,
+        url: location.pathname,
+        hit: (function () {
+          try {
+            var cx = Math.round(window.innerWidth / 2);
+            var cy = Math.round(window.innerHeight / 2);
+            var el = document.elementFromPoint(cx, cy);
+            if (!el) return '(null)';
+            var out = [];
+            var n = el;
+            for (var i = 0; i < 4 && n; i++) {
+              var cls = n.className ? String(n.className).slice(0, 28) : '';
+              out.push(n.tagName.toLowerCase() + (cls ? ('.' + cls) : ''));
+              n = n.parentElement;
+            }
+            return out.join(' < ');
+          } catch (e) { return 'err'; }
+        })(),
+        // 该元素自身的文本（能看出是不是列表条目）、背景与层叠信息
+        info: (function () {
+          try {
+            var cx = Math.round(window.innerWidth / 2);
+            var cy = Math.round(window.innerHeight / 2);
+            var el = document.elementFromPoint(cx, cy);
+            if (!el) return '(null)';
+            var cs = getComputedStyle(el);
+            var r = el.getBoundingClientRect();
+            return 'text=' + JSON.stringify((el.textContent || '').trim().slice(0, 20))
+              + ' rect=' + Math.round(r.left) + ',' + Math.round(r.top) + ' '
+              + Math.round(r.width) + 'x' + Math.round(r.height)
+              + ' pos=' + cs.position + ' z=' + cs.zIndex
+              + ' bg=' + cs.backgroundColor + ' op=' + cs.opacity
+              + ' vis=' + cs.visibility + ' disp=' + cs.display
+              + ' ovf=' + cs.overflow;
+          } catch (e) { return 'err'; }
+        })(),
+        // 当前滚动位置（判断内容是不是被滚走了）
+        scroll: (function () {
+          try {
+            var se = document.scrollingElement || document.documentElement;
+            return 'top=' + Math.round(se.scrollTop) + ' h=' + Math.round(se.scrollHeight)
+              + ' vh=' + Math.round(window.innerHeight)
+              + ' bodyOv=' + getComputedStyle(document.body).overflow;
+          } catch (e) { return 'err'; }
+        })(),
+      });
       var cvs = document.querySelectorAll('canvas');
       var info = [];
       for (var i = 0; i < cvs.length && i < 3; i++) {
