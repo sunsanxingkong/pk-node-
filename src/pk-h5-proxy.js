@@ -431,6 +431,25 @@ const H5_INJECT = `(function () {
       // ?pkbot= 只挂在入口页 URL，H5 跳到 exercise/result 时自拼 URL 不带 → 开关全回「关」，
       // 故跳转时一并带上。
       if (u.indexOf('pkbot=') < 0) add.push('pkbot=' + encodeURIComponent(pkBotCurrentRaw()));
+      // ★★ 2026-10-04：**必须带上 YFD_U**（用户指出「跳转排行榜的 url 有问题」，就是这里）。
+      //
+      // leo-web-study-group（荣誉榜 / 收到的赞 / like-list）取身份的优先级：
+      //   ① location.search 里的 YFD_U / _deviceId            ← 最高
+      //   ② cookie 的 deviceId / YFD_U
+      //   ③ 都没有 → Date.now()+'-'+Math.random() 随机生成
+      //
+      // 原来只补 leoAccountId/pkbot、不补 YFD_U，于是新开的容器第一屏就落到 ②/③：
+      //   · App 容器每次加载都清 127.0.0.1 的 cookie → ② 拿不到 → ③ 随机 → 身份不稳定；
+      //   · 只有等 H5_INJECT 的补丁把 YFD_U 写回 URL/cookie，才「事后」修正。
+      // 同一 URL 在浏览器里正常，正是浏览器那侧 cookie 带着真值。
+      //
+      // 这里直接把真设备身份写进跳转 URL，与入口页/浏览器完全对齐。
+      // （注意：本段在模板字符串里，注释**不能出现反引号**。）
+      var did = '';
+      try { did = window.__PK_DEVICE_ID || ''; } catch (e) { /* ignore */ }
+      if (did && u.indexOf('YFD_U=') < 0 && u.indexOf('_deviceId=') < 0) {
+        add.push('YFD_U=' + encodeURIComponent(did));
+      }
       if (!add.length) return u;
       var hashIdx = u.indexOf('#');
       var hash = hashIdx >= 0 ? u.slice(hashIdx) : '';
@@ -551,6 +570,23 @@ const H5_INJECT = `(function () {
         // 否则 history.back() 会把刚打开的结算页顶掉 → 答完题返回主界面。故 3 秒内刚 openWebView 则忽略。
         if (Date.now() - pkJustOpenedWebView < 3000) {
           diag('closeWebView-ignored', { sinceOpenMs: Date.now() - pkJustOpenedWebView });
+          return 'OK';
+        }
+        // ★ 2026-10-04：App 容器里，返回交给**宿主导航**处理。
+        //
+        // 浏览器（pk-node 管理后台 iframe）里 history.back() 是对的 —— 所有页面在
+        // 同一个 iframe 里，历史栈由页面自己持有。
+        //
+        // 但 App 容器里，每个下级页都是**独立的 WebView**（App 导航压栈），
+        // WebView 自身 history.length === 1 → history.back() 什么都不做 →
+        // 表现就是「点 PK 主页的返回键没反应」。
+        //
+        // 所以 inApp 时改为发 leo://close，由宿主接住：
+        //   · 入口容器 → 回 App 首页（RouteHome）
+        //   · 下级容器 → pop 回上一层（带原生转场 + 预测性返回）
+        if (window.__PK_IN_APP) {
+          diag('closeWebView-inapp', {});
+          try { location.href = 'leo://close'; } catch (e) { /* ignore */ }
           return 'OK';
         }
         diag('closeWebView-back', {});
@@ -1284,6 +1320,44 @@ const H5_INJECT = `(function () {
             return out.join(' | ').slice(0, 900);
           } catch (e) { return 'err:' + (e && e.message); }
         })(),
+        // ★ 2026-10-04：补充诊断（荣誉榜「收到的赞 undefined」定位用）。
+        //   · ck：真实 document.cookie（看身份 cookie 有没有落地）
+        //   · pkUser：window.__PK_USER / __PK_DEVICE_ID 是否真的存在
+        //   · frog：study-group 的 localStorage 用户信息键
+        //   · praise：含「赞」或 undefined 的可见元素文本
+        ck: String(document.cookie || '').slice(0, 300),
+        pkUser: (function () {
+          try {
+            return 'uid=' + ((window.__PK_USER && window.__PK_USER.userId) || 0)
+              + ' did=' + (window.__PK_DEVICE_ID || '')
+              + ' leo=' + (window.__PK_LEO_ID || '');
+          } catch (e) { return 'err'; }
+        })(),
+        frog: (function () {
+          try {
+            var out = [];
+            for (var z = 0; z < localStorage.length; z++) {
+              var k = localStorage.key(z);
+              if (String(k).indexOf('frog') >= 0 || String(k).indexOf('study_group') >= 0) {
+                out.push(k + '=' + String(localStorage.getItem(k)).slice(0, 60));
+              }
+            }
+            return out.join(' | ').slice(0, 300) || '(none)';
+          } catch (e) { return 'err'; }
+        })(),
+        praise: (function () {
+          try {
+            var out = [];
+            var all2 = document.querySelectorAll('div,span,p,a,button');
+            for (var q = 0; q < all2.length && out.length < 12; q++) {
+              if (all2[q].children.length) continue;
+              var t2 = (all2[q].textContent || '').trim();
+              if (!t2 || t2.length > 30) continue;
+              if (t2.indexOf('赞') >= 0 || t2.indexOf('undefined') >= 0) out.push(t2);
+            }
+            return out.join(' / ') || '(none)';
+          } catch (e) { return 'err'; }
+        })(),
       });
     } catch (e) { diag('bot-dom', { err: String(e && e.message) }); }
   }
@@ -1357,6 +1431,13 @@ function rewriteHtml(html, opts) {
   //    __PK_USER：H5 的 isLogin 依赖它，没有真实 userId 会死循环刷新。
   const pre = [
     leoId ? '<script>window.__PK_LEO_ID=' + JSON.stringify(leoId) + ';</script>' : '',
+    // ★ 2026-10-04：告诉 H5「我跑在 App 容器里，不是浏览器 iframe」。
+    //   差别在于**返回语义**：App 里每个下级页是独立 WebView（App 导航压栈），
+    //   history.back() 无效，必须发 leo://close 交给宿主导航（见 closeWebView）。
+    //   宿主在 URL 上带 `__pkInApp=1`（见 App 的 PkHostOrchestrator.h5Url）。
+    String(opts && opts.inApp) === '1'
+      ? '<script>window.__PK_IN_APP=true;</script>'
+      : '',
     '<script>window.__PK_STORAGE_PRESET={"oral-pk-guide":"true"};</script>',
     user ? '<script>window.__PK_USER=' + JSON.stringify(user) + ';</script>' : '',
     // 年级单独暴露一份，供 getExerciseInfo/getExerciseConfig 等能力桥使用。
@@ -1562,6 +1643,8 @@ async function serve(req, res, u) {
       // ★ 2026-10-04：把宿主的状态栏高度（px）透传给 H5 —— URL 上的 `sbh`。
       //   桥的 getImmerseStatusBarHeight 用它给抬头留位（回 0 会让界面顶到状态栏下）。
       sbh: u.searchParams.get('sbh'),
+      // ★ 2026-10-04：告诉 H5「跑在 App 容器里」—— 决定 closeWebView 的返回语义。
+      inApp: u.searchParams.get('__pkInApp'),
     });
     contentType = 'text/html';
   } else if (cdnUrl.endsWith('.js') || contentType.indexOf('javascript') >= 0) {
