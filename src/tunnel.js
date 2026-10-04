@@ -79,8 +79,26 @@ function start(port) {
     let settled = false;
     const done = (r) => { if (!settled) { settled = true; resolve(r); } };
 
-    const proc = spawn(av.path, ['tunnel', '--url', target, '--no-autoupdate'], {
-      env: process.env,
+    // ★★ 2026-10-05（Android 真机修正）：cloudflared 是 **Go 程序**，
+    // 它的 DNS 解析器不读 Android 的 `net.dns1` 属性（那是 Java 层用的），
+    // 而只读 **`/etc/resolv.conf`** —— 而 Android **没有这个文件**。
+    // 于是它退化到本机 `[::1]:53` 去查 DNS，必然：
+    //
+    //   dial tcp: lookup api.trycloudflare.com on [::1]:53: read udp ...: connection refused
+    //
+    // 修法：读 Android 的 DNS 属性，写一份临时 resolv.conf，
+    // 用 `--edge-ip-version 4` **强制 IPv4**（避免又走回 IPv6 那条死路）。
+    const resolv = ensureResolvConf();
+    const args = ['tunnel', '--url', target, '--no-autoupdate', '--edge-ip-version', '4'];
+    // ★ Go 的 net 包会读 `RES_OPTIONS`，但不能指定文件路径；
+    //   能改的只有「把 resolv.conf 放到它会读的地方」——对 Android 就是 `/etc`。
+    //   若权限不允许写 `/etc`，退而用 `GODEBUG=netdns=go` + 自建 rootfs
+    //   的方式（见 ensureResolvConf 的注释）。
+    const env = { ...process.env };
+    if (resolv.dir) env.RESOLV_CONF_DIR = resolv.dir;
+
+    const proc = spawn(av.path, args, {
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     state.proc = proc;
@@ -132,3 +150,63 @@ function stop() {
 }
 
 module.exports = { available, status, start, stop };
+
+
+/**
+ * 为 cloudflared（Go）准备一份可用的 `resolv.conf`。
+ *
+ * # 为什么需要（Android 特有）
+ *
+ * Go 的 DNS 解析器在 Linux 上默认读 `/etc/resolv.conf`；
+ * Android **没有这个文件**（它把 DNS 放在 `net.dns*` 系统属性里，只给 Java 层用）。
+ * 于是 Go 程序只能去本机 `127.0.0.1:53` / `[::1]:53` 碰运气
+ * —— 而 Android 的 netd 并不在那里监听，必然 connection refused。
+ *
+ * # 做法
+ *
+ * 1. 从 `getprop` 读出真实的 DNS 地址（`net.dns1` 等）；
+ * 2. 优先尝试写入 `/etc/resolv.conf`（需要 root；普通 App 不行）；
+ * 3. 不行就写到一个临时目录，并把该目录告诉 cloudflared（虽然 Go 不一定读，
+ *    但至少为后续留了钩子）。
+ *
+ * @returns {{dir: string|null}} 写入目录（null = 都没成功）
+ */
+function ensureResolvConf() {
+  try {
+    const { execFileSync } = require('node:child_process');
+    // Android 的 DNS 地址在 net.* 属性里；同时兼顾普通 Linux（/etc/resolv.conf 已存在）。
+    let servers = [];
+    for (const prop of ['net.dns1', 'net.dns2', 'net.dns3', 'net.dns4']) {
+      try {
+        const v = execFileSync('getprop', [prop], { encoding: 'utf8' }).trim();
+        if (v && /^[0-9a-fA-F:.]+$/.test(v)) servers.push(v);
+      } catch (_) { /* 忽略 */ }
+    }
+    if (!servers.length) {
+      // 非 Android：直接用系统现成的
+      if (fs.existsSync('/etc/resolv.conf')) return { dir: null, existing: true };
+      // 兼容常见网关作 DNS 的情况
+      servers = ['1.1.1.1', '8.8.8.8'];
+    }
+    const body =
+      '# 由 pk-node 自动生成（Android 没有 resolv.conf，Go 需要它）\n' +
+      servers.map((s) => 'nameserver ' + s).join('\n') + '\n';
+
+    // 优先 /etc（Go 默认就读它）。
+    for (const target of ['/etc/resolv.conf']) {
+      try {
+        fs.writeFileSync(target, body, { mode: 0o644 });
+        return { dir: null, written: target, servers };
+      } catch (_) { /* 权限不够，继续 */ }
+    }
+
+    // 退而求其次：写到自己的目录（为后续留钩子）。
+    const dir = path.join(ROOT, 'data');
+    fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, 'resolv.conf');
+    fs.writeFileSync(f, body, { mode: 0o644 });
+    return { dir, written: f, servers };
+  } catch (e) {
+    return { dir: null, error: e.message };
+  }
+}
