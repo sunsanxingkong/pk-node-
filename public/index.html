@@ -303,7 +303,8 @@
         <b>纯 Node 直连复刻「匹配 → 对战 → 提交」全流程</b>：活动主页 → 8 人匹配（机器人补位）
         → WebSocket 对战 → 逐题作答 → 结算。与官方 H5 同协议（ws v2 帧），<b>不经浏览器</b>。<br>
         <b>「提交时间」= 每题收到出题信号（QUESTION_START）后延迟多久发答案</b> ——
-        服务端按题目开始时间计时 costTime，<b>越快排名越靠前</b>（实测 0.05~0.15s 延迟可拿第 1 名）。
+        服务端按「题目开始到收到答案」的实际时间记 costTime；<b>但每个榜有上榜下限</b>
+        （低于它不上榜，见下方「贴限模式」）。
       </p>
       <div class="row">
         <label class="grow">小猿账号
@@ -312,19 +313,39 @@
         <button id="race-home" class="primary">获取知识点</button>
       </div>
       <div class="row">
+        <label class="grow">子账号（竞速在当前身份下进行）
+          <select id="race-sub"><option value="">（当前身份）</option></select>
+        </label>
+        <button id="race-switch" class="primary">切换</button>
+      </div>
+      <div class="row">
         <label class="grow">知识点
           <select id="race-point"><option value="0">（未获取——点上方按钮）</option></select>
         </label>
       </div>
       <pre id="race-home-status" class="log" style="max-height:160px">（点「获取知识点」）</pre>
 
+      <div class="field">
+        <div class="field-label">成绩模式</div>
+        <div class="radios" id="race-aim-mode">
+          <label class="radio"><input type="checkbox" id="race-aim">
+            <span>贴限模式（抢榜推荐）<em>每个榜有「上榜下限」（低于它判异常不上榜、各榜不同）。
+              自动读该榜榜一作为下限 → 目标 = 榜一 + 安全边距 → 按题数反推每题延迟提交。
+              实测贴限 4900ms 直接拿下榜一；未上榜自动加大边距，上榜后自动收紧逼近。</em></span></label>
+        </div>
+      </div>
+      <div class="row">
+        <label class="grow">安全边距 ms（贴限模式用）<input id="race-aimsafety" type="number" value="40" min="0" placeholder="40"></label>
+      </div>
+
       <div class="row">
         <label class="grow">提交时间最小 ms<input id="race-delaymin" type="number" value="50" min="0"></label>
         <label class="grow">提交时间最大 ms<input id="race-delaymax" type="number" value="150" min="0"></label>
       </div>
       <p class="muted small">
-        <b>推荐 0 / 0（秒答）拿最快名次</b>；想更像真人可填 800~2500。
-        「提交时间」只影响服务端记的 costTime，不影响能否答对（答案来自题目 sample）。
+        <b>贴限模式下「提交时间」自动计算</b>（上方两个输入框仅非贴限时生效）；
+        想更像真人可手动填 800~2500。<b>注意</b>：秒答（0~0）因低于所有榜的下限，会被判异常<b>不上榜</b>；
+        想上榜请用贴限模式或手动填到下限之上。
       </p>
 
       <details class="adv">

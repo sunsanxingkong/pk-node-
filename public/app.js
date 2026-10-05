@@ -1054,16 +1054,21 @@ $('race-home').addEventListener('click', loadRaceHome);
 $('race-rank-load').addEventListener('click', loadRaceRank);
 $('race-run').addEventListener('click', runRace);
 $('race-stop').addEventListener('click', stopRace);
+$('race-leo').addEventListener('change', loadRaceSubs);
+$('race-switch').addEventListener('click', switchRaceSub);
 $('race-presets').addEventListener('click', () => {
-  // 「填入推荐值」：竞赛模式（秒答）
-  $('race-delaymin').value = '0';
-  $('race-delaymax').value = '0';
-  $('race-qcount').value = '0';
-  $('race-rounds').value = '10';
-  $('race-gapmin').value = '800';
-  $('race-gapmax').value = '1500';
-  $('race-battlemax').value = '300000';
-  toast('已填入推荐值：秒答 + 10 局 + 局间 0.8~1.5s', 'ok');
+  // 「填入推荐值」：贴限模式（抢榜首选 —— 自动贴榜一下限）+ 10 局
+  const vals = {
+    'race-aimsafety': '40', 'race-qcount': '0', 'race-rounds': '10',
+    'race-gapmin': '800', 'race-gapmax': '1500', 'race-battlemax': '300000',
+  };
+  for (const [id, v] of Object.entries(vals)) $(id).value = v;
+  $('race-aim').checked = true;
+  // 触发持久化（与 bindPersist 的 change 监听配合）
+  for (const id of [...Object.keys(vals), 'race-aim']) {
+    try { $(id).dispatchEvent(new Event('change')); } catch (e) { /* ignore */ }
+  }
+  toast('已填入推荐值：贴限模式（自动贴榜一抢名次）+ 10 局 + 局间 0.8~1.5s', 'ok');
 });
 
 /**
@@ -1826,6 +1831,43 @@ function fillRaceLeo(accounts) {
     sel.appendChild(o);
   }
   if (prev && accounts.some((a) => String(a.id) === prev)) sel.value = prev;
+  loadRaceSubs();
+}
+
+/** 拉「选中小猿账号」的子账号列表，填进竞速页的子账号下拉（同练习页做法）。 */
+async function loadRaceSubs() {
+  const id = $('race-leo').value;
+  const sel = $('race-sub');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">（当前身份）</option>';
+  if (!id) return;
+  try {
+    const r = await api('/api/leo/accounts/' + id + '/sub-accounts');
+    for (const s of (r.subs || [])) {
+      const o = document.createElement('option');
+      o.value = String(s.userId);
+      o.textContent = (s.nickname || ('账号 ' + s.userId)) + (s.isPrimary ? '（主）' : '') + (s.isCurrent ? ' ← 当前' : '');
+      sel.appendChild(o);
+    }
+  } catch (e) { /* 不影响其它功能 */ }
+}
+
+/** 切换竞速用的子账号（走已攻破的 switch；成功后身份&榜单随之变化）。 */
+async function switchRaceSub() {
+  const id = $('race-leo').value;
+  const target = $('race-sub').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  if (!target) return toast('先选择要切换的子账号', 'err');
+  try {
+    const r = await api('/api/leo/accounts/' + id + '/switch', {
+      method: 'POST', body: { userId: Number(target) },
+    });
+    toast(r.message || '已切换', r.ok ? 'ok' : 'err');
+    await loadRaceSubs();
+    await loadLeoAccounts();   // 刷新账号列表（yfdU/身份变化）
+  } catch (e) {
+    toast(e.message, 'err');
+  }
 }
 
 /** 「获取知识点」：拉活动主页，填知识点下拉 + 状态。 */
@@ -1930,6 +1972,7 @@ async function runRace() {
   const say = (s, cls) => logLine(log, s, cls);
   stopRaceStream();
   const useSample = document.querySelector('input[name="raceUseSample"]:checked');
+  const aimEl = $('race-aim');
   try {
     const r = await api('/api/race/run', {
       method: 'POST',
@@ -1945,6 +1988,8 @@ async function runRace() {
         gapMaxMs: Number($('race-gapmax').value || 0),
         battleMaxMs: Number($('race-battlemax').value || 300000),
         useSample: !useSample || useSample.value === '1',
+        aimCostMode: !!(aimEl && aimEl.checked),
+        aimSafetyMs: Number($('race-aimsafety').value || 40),
       },
     });
     state.raceJobId = r.jobId;
@@ -1988,9 +2033,9 @@ async function stopRace() {
 /** 竞速事件渲染。 */
 function renderRaceEvent(d, log) {
   let cls = '';
-  if (d.type === 'ss-ack-ok' || d.type === 'ok' || d.type === 'ss-finish' || d.type === 'ss-detail-ok') cls = 'l-ok';
-  else if (d.type === 'ss-warn' || d.type === 'fail' || d.type === 'ss-gate') cls = 'l-warn';
-  else if (d.type === 'ss-round' || d.type === 'ss-gap' || d.type === 'ss-countdown') cls = 'l-dim';
+  if (d.type === 'ss-ack-ok' || d.type === 'ok' || d.type === 'ss-finish' || d.type === 'ss-detail-ok' || d.type === 'ss-aim-ok') cls = 'l-ok';
+  else if (d.type === 'ss-warn' || d.type === 'fail' || d.type === 'ss-gate' || d.type === 'ss-aim-fail' || d.type === 'ss-aim-warn') cls = 'l-warn';
+  else if (d.type === 'ss-round' || d.type === 'ss-gap' || d.type === 'ss-countdown' || d.type === 'ss-aim' || d.type === 'ss-aim-adjust') cls = 'l-dim';
   logLine(log, (d.message || d.type), cls);
   if (d.finished) {
     $('race-stop').disabled = true;
@@ -2148,8 +2193,11 @@ const PERSIST_IDS = [
   // 开学季竞速
   'race-delaymin', 'race-delaymax', 'race-qcount', 'race-grade', 'race-rounds',
   'race-gapmin', 'race-gapmax', 'race-battlemax', 'race-rank-scope',
-  'race-rank-lat', 'race-rank-lng',
+  'race-rank-lat', 'race-rank-lng', 'race-aimsafety',
 ];
+
+/* 复选框型配置（bindPersist 只处理 value；这里单独持久化） */
+const PERSIST_CHECKS = ['race-aim'];
 
 function bindPersist() {
   for (const id of PERSIST_IDS) {
@@ -2164,6 +2212,17 @@ function bindPersist() {
     const save = () => { try { localStorage.setItem(key, el.value); } catch (e) { /* ignore */ } };
     el.addEventListener('change', save);
     el.addEventListener('blur', save);
+  }
+  for (const id of PERSIST_CHECKS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    const key = 'pknode.cfg.' + id;
+    try {
+      const saved = localStorage.getItem(key);
+      if (saved !== null) el.checked = saved === '1';
+    } catch (e) { /* ignore */ }
+    const save = () => { try { localStorage.setItem(key, el.checked ? '1' : '0'); } catch (e) { /* ignore */ } };
+    el.addEventListener('change', save);
   }
 }
 

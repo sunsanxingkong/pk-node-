@@ -361,6 +361,10 @@ function makeExerciseConfig(b) {
  *
  * 「提交时间」= 每题收到 QUESTION_START 后延迟多久发 ANSWER
  * （服务端按 qStartAt 计时 costTime）。其余为可选行为开关。
+ *
+ * 「贴限模式」（aimCostMode）：每个榜有「上榜下限」（低于它判异常不上榜），
+ * 自动读该榜榜一作为下限估计，目标 = 榜一 + aimSafetyMs，反推每题延迟 ——
+ * 拿「服务端可接受的最快成绩」抢榜（实测贴限 4900ms 直接 rank=1）。
  */
 function makeRaceConfig(b) {
   const numOr = (v, def) => (v == null || v === '' ? def : Number(v));
@@ -372,6 +376,9 @@ function makeRaceConfig(b) {
     answerDelayMinMs: Math.max(0, numOr(b.answerDelayMinMs, 50)),
     answerDelayMaxMs: Math.max(0, numOr(b.answerDelayMaxMs, 150)),
     useSample: b.useSample !== false,               // 默认抄 sample
+    // ★ 贴限模式：自动读该榜榜一（= 上榜下限）→ 目标 = 榜一 + 安全边距 → 反推每题延迟
+    aimCostMode: b.aimCostMode === true || b.aimCostMode === 1 || b.aimCostMode === '1',
+    aimSafetyMs: Math.max(0, numOr(b.aimSafetyMs, 40) || 0),
     gapMinMs: Math.max(0, Number(b.gapMinMs) || 0),
     gapMaxMs: Math.max(0, Number(b.gapMaxMs) || 0),
     battleMaxMs: Math.max(10000, Number(b.battleMaxMs) || 5 * 60 * 1000),
@@ -1199,7 +1206,7 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds);
     const start = jobs.startRaceJob({ jobId: jobId });
     db.audit(user.id, 'race_run',
-      `job=${jobId} leo=${acc.id} rounds=${cfg.rounds} point=${cfg.pointId} delay=${cfg.answerDelayMinMs}~${cfg.answerDelayMaxMs}`, clientIp(req));
+      `job=${jobId} leo=${acc.id} rounds=${cfg.rounds} point=${cfg.pointId} delay=${cfg.answerDelayMinMs}~${cfg.answerDelayMaxMs} aim=${cfg.aimCostMode ? 'on(' + cfg.aimSafetyMs + 'ms)' : 'off'}`, clientIp(req));
     if (!start.ok) {
       db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
       return sendJson(res, 400, { ok: false, jobId: jobId, message: start.message });

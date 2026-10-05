@@ -576,7 +576,10 @@ function startRaceJob(o) {
   db.setJobStatus(job.id, 'running', { startedAt: Date.now() });
   publish(job.id, {
     type: 'status', race: true, jobId: job.id,
-    message: `竞速任务开始：${job.rounds_total} 局（知识点 ${cfg.pointId || '自动'}，提交延迟 ${cfg.answerDelayMinMs || 0}~${cfg.answerDelayMaxMs || 0}ms）`,
+    message: `竞速任务开始：${job.rounds_total} 局（知识点 ${cfg.pointId || '自动'}，` +
+      (cfg.aimCostMode
+        ? `贴限模式，安全边距 ${Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40}ms）`
+        : `提交延迟 ${cfg.answerDelayMinMs || 0}~${cfg.answerDelayMaxMs || 0}ms）`),
     at: Date.now(),
   });
 
@@ -617,6 +620,9 @@ async function runRaceLoop(job, cfg, ctx) {
     emit({ type: 'ss-status', message: `年级未指定 → 用账号年级 ${grade}`, at: Date.now() });
   }
 
+  // ★ 贴限模式（aimCostMode）：安全边距跨局自调 —— 未上榜加大、上榜后收紧逼近下限
+  let aimSafety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40;
+
   for (let i = done + 1; i <= job.rounds_total; i++) {
     if (ctx.stopped) {
       db.setJobStatus(jobId, ctx.paused ? 'paused' : 'stopped', {
@@ -639,6 +645,7 @@ async function runRaceLoop(job, cfg, ctx) {
       res = await schoolSeason.runOneRace(ctx.jar, {
         pointId: cfg.pointId, questionCount: cfg.questionCount, grade: grade,
         answerDelayMinMs: cfg.answerDelayMinMs, answerDelayMaxMs: cfg.answerDelayMaxMs,
+        aimCostMode: cfg.aimCostMode === true, aimSafetyMs: aimSafety,
         useSample: cfg.useSample !== false,
         battleMaxMs: cfg.battleMaxMs,
       }, (ev) => emit(Object.assign({ round: i, at: Date.now() }, ev)), ctx.signal);
@@ -669,6 +676,18 @@ async function runRaceLoop(job, cfg, ctx) {
       message: `第 ${i} 局${res.ok ? '成功' : '失败'}：${res.message}`,
       detail: res.detail, at: Date.now(),
     });
+
+    // ★ 贴限反馈自调：未上榜（rank=999）→ 下局加大安全边距；
+    //   已上榜但不是榜一 → 缓慢收紧，逼近下限抢更前名次。
+    if (cfg.aimCostMode) {
+      if (res.aimAccepted === false) {
+        aimSafety = Math.min(600, aimSafety + 50);
+        emit({ type: 'ss-aim-adjust', message: `贴限自调：本局未上榜（${res.costTimeMs}ms 被判异常）→ 安全边距上调至 ${aimSafety}ms`, at: Date.now() });
+      } else if (res.aimAccepted === true && res.aimRank != null && Number(res.aimRank) > 1 && aimSafety > 20) {
+        aimSafety = Math.max(20, aimSafety - 10);
+        emit({ type: 'ss-aim-adjust', message: `贴限自调：榜单名次 ${res.aimRank} → 安全边距收紧至 ${aimSafety}ms（逼近下限）`, at: Date.now() });
+      }
+    }
 
     // 连续失败太多就停
     if (failed >= 5 && done === 0) {

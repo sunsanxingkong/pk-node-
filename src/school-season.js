@@ -48,6 +48,13 @@
  *
  * ANSWER 帧里**没有** costTime —— 服务端用 `qStartAt`（QUESTION_START 下发）到 ANSWER 到达的
  * 时间差记本题 costTime。所以「自定义提交时间」= 收到 QUESTION_START 后延迟多久发 ANSWER。
+ *
+ * # ★ 「贴限模式」（aimCostMode，2026-10-05）
+ *
+ * 榜单有「上榜下限」：低于它的成绩被判异常不上榜（`self.rank=999`），**每个榜不同**
+ * （实测 2035=4900 / 2037=5600 / 2036=7000ms，恰为该榜榜一值）。服务端按物理时间
+ * 计时（帧 ts 无法干预，已实验证伪）。「抢榜」= 精确贴着下限提交：读榜一 → target=榜一+safety
+ * → delay=target/N-184ms（每题固定开销实测 ≈184ms）。实测 306ms/题 → 4900ms → rank=1。
  */
 
 const https = require('node:https');
@@ -520,6 +527,9 @@ class WsClient {
     const frame = { v: 2, type: type, reqId: reqId, gen: this.gen, ts: Date.now() };
     if (extra && extra.rid) frame.rid = extra.rid;
     if (extra && typeof extra.rv === 'number') frame.rv = extra.rv;
+    // ★ 帧时间戳覆盖（复验用）：实验已证伪 —— 服务端按物理时间计时（qStartAt→到达），
+    //   帧 ts 不影响 costTime，此开关保留仅供复验。
+    if (extra && typeof extra.ts === 'number' && Number.isFinite(extra.ts)) frame.ts = extra.ts;
     if (data !== undefined) frame.data = data;
     const text = JSON.stringify(frame);
     if (Buffer.byteLength(text, 'utf8') > 65536) throw new Error('FRAME_TOO_LARGE');
@@ -598,6 +608,44 @@ async function runOneRace(jar, cfg, onEvent, signal) {
     type: 'ss-home-ok',
     message: `活动主页 OK：知识点「${point.pointName}」(${point.pointId})，题数 ${questionCount}，session=${gameSessionId}`,
   });
+
+  // ★ 0.5) 贴限模式（aimCostMode）：读该榜榜一（= 上榜下限）→ 目标 costTime → 反推每题提交延迟。
+  //
+  //   背景（2026-10-05 实测）：每个榜有「上榜下限」，低于它的成绩被服务端判异常
+  //   （self.rank=999，不上榜），且各榜不同（2035=4900 / 2037=5600 / 2036=7000，
+  //   恰为该榜榜一值）。服务端按「qStartAt → ANSWER 到达」的物理时间计时
+  //   （帧 ts 无法干预，已实验证伪）。因此「突破」= 精确贴着下限提交：
+  //   目标 = 榜一 + safety，拿到「服务端可接受的最快成绩」，抢榜单前排。
+  //
+  //   模型（实测拟合，N=10 时误差 ±20ms）：costTime ≈ N × (delay + 184ms)
+  //   （184ms = 每题固定开销：广播/网络/服务端处理），→ delay = target / N - 184。
+  let aimInfo = null;
+  let delayMinMs = cfg.answerDelayMinMs;
+  let delayMaxMs = cfg.answerDelayMaxMs;
+  if (cfg.aimCostMode) {
+    const safety = Number(cfg.aimSafetyMs) >= 0 ? Number(cfg.aimSafetyMs) : 40;
+    let base = null;
+    try {
+      const rk = await rank(jar, { pointId: point.pointId, scope: 1, signal });
+      const ranks = (rk.json && rk.json.ranks) || [];
+      const costs = ranks.map((x) => Number(x && x.costTime)).filter((x) => Number.isFinite(x) && x > 0);
+      if (costs.length) base = Math.min.apply(null, costs);
+    } catch (e) { /* 拉榜失败 → 用兜底值 */ }
+    if (base == null) {
+      base = Number(cfg.aimFallbackBaseMs) > 0 ? Number(cfg.aimFallbackBaseMs) : 4900;
+      emit({ type: 'ss-aim', message: `贴限模式：本榜暂无可读榜一，用兜底下限 ${base}ms` });
+    }
+    const target = base + safety;
+    const overhead = Number(cfg.aimOverheadMs) > 0 ? Number(cfg.aimOverheadMs) : 184;
+    const perQ = Math.max(0, Math.round((target / Math.max(1, questionCount)) - overhead));
+    delayMinMs = perQ;
+    delayMaxMs = perQ;
+    aimInfo = { base: base, target: target, delayMs: perQ, safety: safety, overhead: overhead };
+    emit({
+      type: 'ss-aim',
+      message: `贴限模式：榜一 ${base}ms → 目标 ${target}ms → 每题延迟 ${perQ}ms（${questionCount} 题）`,
+    });
+  }
 
   ensureLive();
 
@@ -817,13 +865,17 @@ async function runOneRace(jar, cfg, onEvent, signal) {
           }
           const answer = pickAnswer(q, cfg);
           // ★ 自定义提交时间：收到 QUESTION_START 后延迟发 ANSWER
-          const delay = randomDelay(cfg.answerDelayMinMs, cfg.answerDelayMaxMs);
+          //   （贴限模式下 delayMinMs/delayMaxMs 是瞄准算出的值）
+          const delay = randomDelay(delayMinMs, delayMaxMs);
           if (delay > 0) {
             emit({ type: 'ss-answer-wait', message: `第 ${qNo} 题等 ${(delay / 1000).toFixed(1)}s 后提交`, qNo, delayMs: delay });
             await sleep(delay, signal);
           }
           ensureLive();
-          const rid = battleWs.send(MSG.ANSWER, { qNo, answer });
+          // ★ 帧 ts 复验开关（answerTsSkewMs）：已实验证伪（ts 不影响 costTime），保留仅供复验
+          const skew = Number(cfg.answerTsSkewMs) || 0;
+          const ansExtra = skew ? { ts: Date.now() + skew } : undefined;
+          const rid = battleWs.send(MSG.ANSWER, { qNo, answer }, ansExtra);
           if (rid) {
             state.lastSent = { qNo, answer };
             if (!firstSendLogged) {
@@ -854,6 +906,34 @@ async function runOneRace(jar, cfg, onEvent, signal) {
       message: `对战结束：名次 ${myRank == null ? '?' : myRank}/8` +
         (myCost != null ? `，costTime=${myCost}ms` : '') + `，共提交 ${okCount} 题`,
     });
+
+    // ★ 贴限核验（aimCostMode）：赛后查 self —— rank=999 表示被判异常（未上榜）。
+    //   self 语义（实测）：显示「我的最佳成绩」+ 名次；从未成功则显示最近被拒成绩 + rank=999。
+    let aimAccepted = null;
+    let aimRank = null;
+    let aimSelfCost = null;
+    if (aimInfo && myCost != null) {
+      try {
+        await sleep(1500, signal);
+        const rk2 = await rank(jar, { pointId: point.pointId, scope: 1 });
+        const self = (rk2.json && rk2.json.self) || null;
+        if (self && self.costTime != null) {
+          aimSelfCost = Number(self.costTime);
+          if (Number(self.rank) !== 999) {
+            aimAccepted = true;
+            aimRank = Number(self.rank);
+            emit({ type: 'ss-aim-ok', message: `贴限核验：已上榜（我的最佳 ${aimSelfCost}ms，名次 ${aimRank}）` });
+          } else if (Math.abs(aimSelfCost - Number(myCost)) <= 100) {
+            aimAccepted = false;
+            emit({ type: 'ss-aim-fail', message: `贴限核验：未上榜（${aimSelfCost}ms 被判异常 rank=999）` });
+          } else {
+            emit({ type: 'ss-aim-warn', message: `贴限核验：self=${aimSelfCost}ms/rank=${self.rank}` });
+          }
+        } else {
+          emit({ type: 'ss-aim-warn', message: `贴限核验：self 暂未更新（本局 ${myCost}ms）` });
+        }
+      } catch (e) { /* 核验失败/中断不影响结算 */ }
+    }
     // 名次/成绩摘要（存进 detail 供「任务明细」展示）
     const summary = players
       .slice()
@@ -867,6 +947,10 @@ async function runOneRace(jar, cfg, onEvent, signal) {
       finish: fin,
       rank: myRank,
       costTimeMs: myCost,
+      aim: aimInfo,
+      aimAccepted: aimAccepted,
+      aimRank: aimRank,
+      aimSelfCost: aimSelfCost,
       answers: state.answers,
       detail: '本局结算：' + summary,
     };
