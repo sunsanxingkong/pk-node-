@@ -32,7 +32,7 @@ MIT License —— `bin/native/` 下的第三方二进制不在授权范围内�
 
 | 方式 | 说明 |
 |---|---|
-| **[免安装包（Releases）](https://github.com/sxd91/pk-node/releases/latest)** | 解压即用，**推荐**。含密钥流 + 全部源码，不用 `npm install` |
+| **[免安装包（Releases）](https://github.com/sunsanxingkong/pk-node-/releases/tag/v1.0.2-xixi)** | 解压即用，**推荐**。含密钥流 + 全部源码，不用 `npm install` |
 | `git clone` 源码 | 在项目根运行下面的命令 |
 
 只要求 **Node.js ≥ 22**（用到内置 `node:sqlite`），除此之外零依赖。
@@ -65,7 +65,7 @@ git clone https://github.com/sxd91/pk-node.git && cd pk-node
 ./start.sh                     # Windows：双击 start.bat
 # 默认 http://0.0.0.0:8792，启动后横幅会给出局域网地址（端口被占会自动避让）
 ```
-或直接下 [免安装包](https://github.com/sxd91/pk-node/releases/latest) 解压运行（**推荐**，免 `npm install`）。
+或直接下 [免安装包](https://github.com/sunsanxingkong/pk-node-/releases/tag/v1.0.2-xixi) 解压运行（**推荐**，免 `npm install`）。
 需要 **Node.js ≥ 22**（用到内置 `node:sqlite`），除此之外**零依赖**。
 
 ### 第 1.5 步 · 从别的电脑 / 手机访问（局域网、公网）
