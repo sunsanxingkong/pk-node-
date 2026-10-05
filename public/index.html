@@ -46,6 +46,7 @@
       <button class="nav-btn" data-tab="race">比赛竞速</button>
       <button class="nav-btn" data-tab="accounts">小猿账号</button>
       <button class="nav-btn" data-tab="jobs">任务</button>
+      <button class="nav-btn" data-tab="me">个人中心</button>
       <button class="nav-btn" data-tab="tunnel">穿透</button>
       <button class="nav-btn admin-only hidden" data-tab="admin">管理</button>
     </nav>
@@ -420,6 +421,7 @@
         <button class="tab active" data-leo-tab="sms">短信验证码登录</button>
         <button class="tab" data-leo-tab="password">密码登录</button>
         <button class="tab" data-leo-tab="cookie">粘贴 Cookie</button>
+        <button class="tab" data-leo-tab="qr">扫码登录</button>
       </div>
       <label>备注名（可留空）<input id="leo-name" placeholder="例如：主号"></label>
 
@@ -468,6 +470,23 @@
         <button id="btn-import" class="primary">导入并验证</button>
       </div>
 
+      <!-- 扫码登录 -->
+      <div id="leo-pane-qr" class="hidden">
+        <p class="muted small">
+          生成一张登录二维码，用<b>小猿 App 扫码</b>并在手机上点「确认登录」，本机即可导入该账号。
+          <br>⚠️ 小猿 App 的扫码登录接口为闭源、随版本变动；当前端点为推测值，若生成失败请见「系统」页说明或提供真机抓包校准。
+        </p>
+        <div class="row">
+          <label class="grow">备注名（可留空）<input id="qr-name" placeholder="例如：扫码主号"></label>
+          <button id="btn-qr-create" class="ghost">生成二维码</button>
+        </div>
+        <div id="qr-box" class="qr-box hidden">
+          <img id="qr-img" alt="扫码登录二维码" />
+          <div id="qr-status" class="muted small">等待扫码…</div>
+          <button id="btn-qr-cancel" class="mini">取消</button>
+        </div>
+      </div>
+
       <p id="leo-msg" class="muted small"></p>
       <p class="muted small">
         粘贴的 cookie 里若<b>自带 <code>ks_*</code>（设备链）</b>，导入时<b>优先使用它</b>，
@@ -509,12 +528,77 @@
   <main class="panel hidden" id="tab-jobs">
     <div class="card">
       <h2>历史任务</h2>
-      <button id="btn-refresh-jobs" class="ghost">刷新</button>
+      <div class="row">
+        <button id="btn-refresh-jobs" class="ghost">刷新</button>
+        <button id="jobs-sel-all" class="ghost">全选</button>
+        <button id="jobs-sel-invert" class="ghost">反选</button>
+        <button id="jobs-sel-none" class="ghost">清空选择</button>
+      </div>
+      <div class="row">
+        <button id="jobs-batch-resume" class="ghost">批量启动/继续</button>
+        <button id="jobs-batch-stop" class="danger">批量停止</button>
+        <span id="jobs-sel-count" class="muted small"></span>
+      </div>
       <div id="jobs-list" class="list"></div>
     </div>
     <div class="card">
       <h2>任务明细</h2>
       <div id="job-detail" class="log tall"></div>
+    </div>
+  </main>
+
+  <!-- 个人中心 -->
+  <main class="panel hidden" id="tab-me">
+    <div class="grid2">
+      <div class="card">
+        <h2>我的账号</h2>
+        <div id="me-profile" class="muted small"></div>
+        <h2 style="margin-top:14px">修改密码</h2>
+        <label>原密码</label>
+        <input id="me-old-pw" type="password" autocomplete="current-password" placeholder="原密码">
+        <label>新密码</label>
+        <input id="me-new-pw" type="password" autocomplete="new-password" placeholder="至少 6 位">
+        <label>确认新密码</label>
+        <input id="me-new-pw2" type="password" autocomplete="new-password" placeholder="再输一次">
+        <div class="row" style="margin-top:10px">
+          <button id="me-change-pw">修改密码</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>常用 IP（白名单）</h2>
+        <p class="muted small">加入常用 IP 的地址会标记出来，方便区分「你自己的设备」与陌生登录。</p>
+        <div class="row">
+          <input id="me-ip-input" placeholder="IP，如 1.2.3.4" style="flex:1">
+          <input id="me-ip-label" placeholder="备注（可选）" style="flex:1">
+          <button id="me-ip-add">添加</button>
+        </div>
+        <div id="me-trusted-list" class="list" style="margin-top:10px"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>在线设备（多 IP 登录）</h2>
+      <div class="row">
+        <button id="me-sessions-refresh" class="ghost">刷新</button>
+        <button id="me-kick-others" class="danger">踢出其他所有设备</button>
+        <span id="me-sessions-count" class="muted small"></span>
+      </div>
+      <p class="muted small">同一账号可在多台设备/多个 IP 同时登录；发现陌生设备可单独踢出。</p>
+      <div id="me-sessions-list" class="list"></div>
+    </div>
+
+    <div class="card">
+      <h2>我的登录记录</h2>
+      <div class="row">
+        <button id="my-logins-refresh" class="ghost">刷新</button>
+        <button id="my-logins-del-sel" class="danger">删除选中</button>
+        <button id="my-logins-del-all" class="danger">清空记录</button>
+        <label class="muted small" style="margin-left:8px"><input type="checkbox" id="my-logins-sel-all"> 全选</label>
+        <span id="my-logins-count" class="muted small"></span>
+      </div>
+      <p class="muted small">最近 100 条 · 登录时间、IP 与归属地（含失败尝试，若出现陌生 IP 请尽快改密）</p>
+      <div id="my-logins" class="list"></div>
     </div>
   </main>
 
@@ -552,6 +636,17 @@
       <div id="admin-users" class="list"></div>
     </div>
     <div class="card">
+      <h2>全部小猿账号（所有用户）</h2>
+      <p class="muted small">
+        这里能看到<b>每个用户</b>导入的小猿账号及其 Cookie（CK）。点击「显示 CK」展开，可一键复制。
+        仅管理员可见。
+      </p>
+      <div class="row">
+        <button id="admin-leo-refresh" class="ghost">刷新</button>
+      </div>
+      <div id="admin-leo" class="list"></div>
+    </div>
+    <div class="card">
       <h2>全部任务（所有用户）</h2>
       <p class="muted small">
         这里能看到<b>每个人</b>在跑什么：是刷局还是刷练习、用的哪个小猿账号、以及完整参数。
@@ -562,6 +657,8 @@
         <label class="muted small" style="display:flex;align-items:center;gap:4px">
           <input type="checkbox" id="admin-jobs-only-active"> 只看没结束的
         </label>
+        <button id="admin-jobs-sel-all" class="ghost">全选</button>
+        <button id="admin-jobs-sel-invert" class="ghost">反选</button>
         <button id="admin-jobs-sel-active" class="ghost">选中进行中</button>
         <button id="admin-jobs-sel-none" class="ghost">清空选择</button>
       </div>
@@ -569,6 +666,7 @@
         <button id="admin-jobs-pause" class="ghost">批量暂停</button>
         <button id="admin-jobs-resume" class="ghost">批量继续</button>
         <button id="admin-jobs-stop" class="danger">批量停止</button>
+        <button id="admin-jobs-delete" class="danger">批量删除</button>
         <span id="admin-jobs-count" class="muted small"></span>
       </div>
       <div id="admin-jobs" class="list"></div>
@@ -576,6 +674,24 @@
     <div class="card">
       <h2>任务明细</h2>
       <div id="admin-job-detail" class="log tall"></div>
+    </div>
+    <div class="card">
+      <h2>用户登录记录（所有用户）</h2>
+      <div class="row">
+        <button id="admin-logins-refresh" class="ghost">刷新</button>
+        <button id="admin-logins-del-all" class="danger">清空全部记录</button>
+        <span class="muted small">最近 300 条 · 谁在什么时间、从哪个 IP 登录（含失败尝试）；「删除」可逐条清理</span>
+      </div>
+      <div id="admin-logins" class="list"></div>
+    </div>
+    <div class="card">
+      <h2>在线设备（所有用户）</h2>
+      <div class="row">
+        <button id="admin-sessions-refresh" class="ghost">刷新</button>
+        <span id="admin-sessions-count" class="muted small"></span>
+      </div>
+      <p class="muted small">全部用户的在线会话 · 可按用户或按 IP 强制下线</p>
+      <div id="admin-sessions" class="list"></div>
     </div>
     <div class="card">
       <h2>审计日志</h2>

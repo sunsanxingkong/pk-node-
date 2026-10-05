@@ -13,6 +13,10 @@ const { config, PK, DEFAULT_HOST, lanAddresses } = require('./src/config');
 const db = require('./src/db');
 const auth = require('./src/services/auth');
 const leoAccounts = require('./src/services/leo-accounts');
+const leo = require('./src/leo');
+
+/** 扫码登录的临时会话表：qrKey → { userId, jar, name, createdAt }。进程内有效，重启即清空（二维码本就短时效）。 */
+const qrSessions = new Map();
 const loginSvc = require('./src/services/login');
 const jobs = require('./src/jobs');
 const tunnel = require('./src/tunnel');
@@ -22,6 +26,7 @@ const strokes = require('./src/strokes');
 const exercise = require('./src/exercise');
 const pkH5 = require('./src/pk-h5-proxy');
 const schoolSeason = require('./src/school-season');
+const ipgeo = require('./src/ipgeo');
 
 const PUBLIC_DIR = path.join(config.root, 'public');
 
@@ -264,6 +269,50 @@ function clientIp(req) {
   return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
 
+/**
+ * 从 User-Agent 粗解析设备/浏览器描述（够用即可，不引三方库）。
+ */
+function parseUa(ua) {
+  const s = String(ua || '');
+  if (!s) return '未知设备';
+  let os = '';
+  if (/Windows NT/.test(s)) os = 'Windows';
+  else if (/iPhone|iPad|iPod/.test(s)) os = 'iOS';
+  else if (/Android/.test(s)) os = 'Android';
+  else if (/Mac OS X/.test(s)) os = 'macOS';
+  else if (/Linux/.test(s)) os = 'Linux';
+  let br = '';
+  if (/Edg\//.test(s)) br = 'Edge';
+  else if (/Chrome\//.test(s)) br = 'Chrome';
+  else if (/Firefox\//.test(s)) br = 'Firefox';
+  else if (/Safari\//.test(s)) br = 'Safari';
+  else if (/curl\//i.test(s)) br = 'curl';
+  return [os, br].filter(Boolean).join(' · ') || '未知设备';
+}
+
+/**
+ * 给登录记录批量补 IP 归属（国家/省州/城市/运营商）。
+ * - 内存缓存 24h，命中不发请求；
+ * - 任何失败都静默跳过，绝不拖垮接口（超时 6s/次，最多 8 并发）。
+ */
+async function attachGeo(rows) {
+  const ips = (rows || []).map((r) => r && r.ip).filter(Boolean);
+  if (!ips.length) return rows;
+  let map = {};
+  try {
+    map = await ipgeo.lookupMany(ips, 8);
+  } catch (e) { return rows; }
+  for (const r of rows) {
+    if (!r || !r.ip) continue;
+    const g = map[r.ip];
+    if (g) {
+      r.geo = { country: g.country, region: g.region, city: g.city, isp: g.isp };
+      r.geoText = g.label || '';
+    }
+  }
+  return rows;
+}
+
 /* ---------------------- 登录爆破防护 ------------------------ */
 //
 // ⚠️ 2026-10-03：服务默认改成监听 0.0.0.0（局域网/公网可访问）之后，
@@ -310,6 +359,20 @@ function clampRounds(v, def) {
   const n = Math.floor(Number(v));
   if (!Number.isFinite(n) || n < 1) return Math.max(1, Math.floor(Number(def) || 1));
   return Math.min(n, MAX_ROUNDS);
+}
+
+/**
+ * 按「每用户可刷局数上限」钳制 cfg.rounds（管理员在后台设置的 user.round_limit）。
+ * round_limit>0 且请求轮数超出时，把 cfg.rounds 压到上限，返回 true（被钳制）。
+ * 返回 false 表示未超限（或该用户无限制）。
+ */
+function applyUserRoundLimit(user, cfg) {
+  const limit = Number(user && user.round_limit) || 0;
+  if (limit > 0 && cfg.rounds > limit) {
+    cfg.rounds = limit;
+    return true;
+  }
+  return false;
 }
 
 /* ---------------------- 任务参数构造（单个 / 批量共用） ---------------------- */
@@ -441,6 +504,8 @@ function needAuth(pathname) {
   // App 联动接口：**不走会话鉴权**，改由 `X-PK-Link` 令牌自保护
   // （详见 server.js 里 `/api/link/*` 的注释）。
   if (pathname === '/api/link/handshake' || pathname === '/api/link/accounts') return false;
+  // 健康检查/探活接口：免鉴权，任何外部「逐轮」监控打这个都返回 200，不会 401
+  if (pathname === '/api/health' || pathname === '/api/ping') return false;
   if (pathname.startsWith('/api/')) return true;
   return false;
 }
@@ -454,14 +519,120 @@ async function handleApi(req, res, u, user) {
   const p = u.pathname;
   const method = req.method.toUpperCase();
 
+  /* ------------------------- 健康检查 / 探活（免鉴权） ------------------------- */
+  if ((p === '/api/health' || p === '/api/ping') && method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      status: 'up',
+      uptime: process.uptime() | 0,
+      ts: Date.now(),
+      service: { port: Number(process.env.PK_PORT) || 8792, host: process.env.PK_HOST || '0.0.0.0' },
+    });
+  }
+
   /* ------------------------- 认证 ------------------------- */
 
   if (p === '/api/auth/me' && method === 'GET') {
+    // 带 cookie 但会话已被删除/过期（例如被「踢出设备」）→ 回 false，
+    // 否则前端会拿着已失效的会话以为自己还登录着，kick 之后界面不刷新。
+    if (auth.readSessionCookie(req.headers.cookie) && !user) {
+      return sendJson(res, 200, { ok: true, user: null, kicked: true, service: { port: config.port, host: config.host } });
+    }
     return sendJson(res, 200, {
       ok: true,
-      user: user ? { id: user.id, username: user.username, role: user.role } : null,
+      user: user ? {
+        id: user.id, username: user.username, role: user.role,
+        roundLimit: Number(user.round_limit) || 0,
+        lastLoginAt: user.last_login_at || null,
+      } : null,
       service: { port: config.port, host: config.host },
     });
+  }
+
+  // 我的登录记录：自己什么时候、从哪个 IP 登录过（含失败尝试，失败也带 IP）
+  if (p === '/api/auth/login-history' && method === 'GET') {
+    const history = db.listLoginHistory(user.id, 100);
+    await attachGeo(history);
+    return sendJson(res, 200, { ok: true, history });
+  }
+
+  // 删除登录记录（本人）：ids 为空数组/不传 = 清空全部；带 ids = 删选中
+  if (p === '/api/auth/login-history' && method === 'DELETE') {
+    const b = await readJson(req).catch(() => ({}));
+    const n = db.deleteLoginHistory(user.id, b.ids);
+    db.audit(user.id, 'login_history_delete', `删除 ${n} 条（${Array.isArray(b.ids) && b.ids.length ? '选中' : '全部'}）`, clientIp(req));
+    return sendJson(res, 200, { ok: true, deleted: n });
+  }
+
+  /* --------------------- 个人中心：会话（多 IP 登录管理） --------------------- */
+
+  // 列出自己所有在线设备（含当前这台）
+  if (p === '/api/me/sessions' && method === 'GET') {
+    const cur = auth.readSessionCookie(req.headers.cookie);
+    const rows = db.listSessionsByUser(user.id);
+    const ips = rows.map((r) => r.ip).filter(Boolean);
+    let geoMap = {};
+    try { geoMap = await ipgeo.lookupMany(ips, 10); } catch (e) { geoMap = {}; }
+    const trusted = new Set(db.listTrustedIps(user.id).map((t) => t.ip));
+    const sessions = rows.map((r) => {
+      const g = r.ip ? geoMap[r.ip] : null;
+      return {
+        token: r.token.slice(0, 8) + '…', // 只回前缀，不回完整 token
+        tokenFull: r.token,               // 供本页「踢出」使用（仅本人可见）
+        current: r.token === cur,
+        ip: r.ip,
+        geo: g ? { country: g.country, region: g.region, city: g.city, isp: g.isp } : null,
+        geoText: g ? g.label : '',
+        trusted: r.ip ? trusted.has(r.ip) : false,
+        createdAt: r.created_at,
+        lastSeen: r.last_seen || r.created_at,
+        ua: r.ua || '',
+        device: parseUa(r.ua),
+      };
+    });
+    return sendJson(res, 200, { ok: true, sessions, total: sessions.length });
+  }
+
+  // 踢出指定设备（其他 IP）；带 token 则只踢那一个，otherwise 踢「除当前外的全部」
+  if (p === '/api/me/sessions/kick' && method === 'POST') {
+    const b = await readJson(req).catch(() => ({}));
+    const cur = auth.readSessionCookie(req.headers.cookie);
+    let n = 0;
+    if (b.token) {
+      if (String(b.token) === cur) return sendJson(res, 400, { ok: false, message: '不能踢出当前设备' });
+      n = db.deleteSessionOfUser(user.id, String(b.token));
+    } else if (b.ip) {
+      const rows = db.listSessionsByUser(user.id).filter((r) => r.ip === String(b.ip) && r.token !== cur);
+      for (const r of rows) n += db.deleteSessionOfUser(user.id, r.token);
+    } else {
+      // 全部其他设备
+      const rows = db.listSessionsByUser(user.id).filter((r) => r.token !== cur);
+      for (const r of rows) n += db.deleteSessionOfUser(user.id, r.token);
+    }
+    db.audit(user.id, 'session_kick', `踢出 ${n} 个会话${b.ip ? ' ip=' + b.ip : ''}`, clientIp(req));
+    return sendJson(res, 200, { ok: true, kicked: n });
+  }
+
+  /* --------------------- 个人中心：常用 IP --------------------- */
+
+  if (p === '/api/me/trusted-ips' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, ips: db.listTrustedIps(user.id) });
+  }
+
+  if (p === '/api/me/trusted-ips' && method === 'POST') {
+    const b = await readJson(req).catch(() => ({}));
+    const ip = String(b.ip || '').trim();
+    if (!ip) return sendJson(res, 400, { ok: false, message: '缺少 IP' });
+    const id = db.addTrustedIp(user.id, ip, b.label);
+    db.audit(user.id, 'trusted_ip_add', ip + (b.label ? '（' + b.label + '）' : ''), clientIp(req));
+    return sendJson(res, 200, { ok: true, id, ips: db.listTrustedIps(user.id) });
+  }
+
+  const trustedDel = /^\/api\/me\/trusted-ips\/(\d+)$/.exec(p);
+  if (trustedDel && method === 'DELETE') {
+    const n = db.deleteTrustedIp(user.id, Number(trustedDel[1]));
+    db.audit(user.id, 'trusted_ip_del', 'id=' + trustedDel[1], clientIp(req));
+    return sendJson(res, 200, { ok: true, deleted: n, ips: db.listTrustedIps(user.id) });
   }
 
   if (p === '/api/auth/register' && method === 'POST') {
@@ -482,7 +653,10 @@ async function handleApi(req, res, u, user) {
       }, { 'Retry-After': String(wait) });
     }
     const b = await readJson(req);
-    const r = auth.login(b.username, b.password);
+    const r = auth.login(b.username, b.password, {
+      ip: clientIp(req),
+      ua: String(req.headers['user-agent'] || ''),
+    });
     if (!r.ok) {
       const n = noteLoginFail(peerIp);
       if (n >= config.loginFailMax) {
@@ -492,7 +666,10 @@ async function handleApi(req, res, u, user) {
     }
     db.audit(r.user ? r.user.id : null, 'login', r.ok ? '成功' : '失败:' + b.username, clientIp(req));
     if (!r.ok) return sendJson(res, 401, r);
-    return sendJson(res, 200, { ok: true, user: r.user }, { 'Set-Cookie': auth.sessionSetCookie(r.token) });
+    return sendJson(res, 200, {
+      ok: true, user: r.user,
+      sameIpSessions: r.sameIpSessions, trustedIp: r.trustedIp,
+    }, { 'Set-Cookie': auth.sessionSetCookie(r.token) });
   }
 
   if (p === '/api/auth/logout' && method === 'POST') {
@@ -620,6 +797,42 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     // 审计里**绝不写密码**，只记手机号与结果
     db.audit(user.id, 'leo_password_login', `${b.phone} → ${r.ok ? '成功 id=' + r.accountId : r.message}`, clientIp(req));
     return sendJson(res, r.ok ? 200 : 400, r);
+  }
+
+  /* ------------------------ 小猿扫码登录（QR）------------------------ */
+  // ⚠️ 端点路径来自 config.qrLogin（最佳推测，需真机抓包校准）；其余逻辑通用。
+  if (p === '/api/leo/login/qr/create' && method === 'POST') {
+    const b = await readJson(req).catch(() => ({}));
+    const jar = new leo.CookieJar([]);
+    const r = await leo.ytkQrCreate(jar);
+    if (!r.ok) return sendJson(res, 502, { ok: false, message: r.message });
+    qrSessions.set(r.qrKey, {
+      userId: user.id,
+      jar,
+      name: String((b && b.name) || '扫码账号'),
+      createdAt: Date.now(),
+    });
+    return sendJson(res, 200, { ok: true, qrKey: r.qrKey, qrContent: r.qrContent });
+  }
+  if (p === '/api/leo/login/qr/poll' && method === 'GET') {
+    const qrKey = u.searchParams.get('qrKey');
+    const s = qrSessions.get(qrKey);
+    if (!s) return sendJson(res, 404, { ok: false, message: '二维码不存在或已过期' });
+    if (s.userId !== user.id) return sendJson(res, 403, { ok: false, message: '无权查看该二维码' });
+    if (Date.now() - s.createdAt > config.qrLogin.expireMs) {
+      qrSessions.delete(qrKey);
+      return sendJson(res, 410, { ok: false, message: '二维码已过期，请重新生成' });
+    }
+    const r = await leo.ytkQrPoll(s.jar, qrKey);
+    if (r.status === 2) {
+      // 已确认：登录态 cookie 已被 s.jar 吸收，转成文本导入为小猿账号
+      const cookieText = s.jar.items.map((c) => c.name + '=' + c.value).join('; ');
+      const imp = await leoAccounts.importAccount({ appUserId: user.id, name: s.name, cookieText });
+      qrSessions.delete(qrKey);
+      db.audit(user.id, 'leo_qr_login', imp.ok ? '成功 id=' + imp.id : '失败:' + imp.message, clientIp(req));
+      return sendJson(res, imp.ok ? 200 : 400, Object.assign({ ok: imp.ok, status: 2 }, imp));
+    }
+    return sendJson(res, 200, { ok: true, status: r.status });
   }
 
   /* ------------------------ 小猿账号 ------------------------ */
@@ -927,12 +1140,14 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
       if (kind === 'exercise') {
         const cfg = makeExerciseConfig(b);
         if (cfg.error) { results.push({ leoAccountId: leoId, name: acc.name, ok: false, message: cfg.error }); continue; }
+        applyUserRoundLimit(user, cfg);
         jobId = db.createJob(user.id, leoId, null, cfg, cfg.rounds);
         start = jobs.startExerciseJob({ jobId: jobId });
         if (!start.ok) db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
       } else {
         const cfg = makePkConfig(b);
         if (cfg.error) { results.push({ leoAccountId: leoId, name: acc.name, ok: false, message: cfg.error }); continue; }
+        applyUserRoundLimit(user, cfg);
         jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, cfg.rounds);
         start = jobs.startJob({ jobId: jobId });
         if (!start.ok) db.setJobStatus(jobId, 'failed', { finishedAt: Date.now(), error: start.message });
@@ -961,6 +1176,7 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
 
     const cfg = makePkConfig(b);
     if (cfg.error) return sendJson(res, 400, { ok: false, message: cfg.error });
+    applyUserRoundLimit(user, cfg);
     const rounds = cfg.rounds;
     const jobId = db.createJob(user.id, leoId, cfg.subUserId, cfg, rounds);
     db.audit(user.id, 'job_create', `job=${jobId} rounds=${rounds} pointId=${cfg.pointId}`, clientIp(req));
@@ -1118,6 +1334,7 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     // 刷练习走正经后台任务：写一条 jobs 记录（kind='exercise'）再交给 startExerciseJob，
     // 于是任务页可见、逐轮落库、可停止、与刷局共用 SSE。
     const cfg = makeExerciseConfig(b);
+    applyUserRoundLimit(user, cfg);
     const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds);
     const start = jobs.startExerciseJob({ jobId: jobId });
     db.audit(user.id, 'exercise_run', `job=${jobId} leo=${acc.id} rounds=${cfg.rounds} limit=${cfg.limit} kp=${cfg.keypointId}`, clientIp(req));
@@ -1203,6 +1420,7 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     if (!acc || acc.user_id !== user.id) return sendJson(res, 404, { ok: false, message: '小猿账号不存在' });
 
     const cfg = makeRaceConfig(b);
+    applyUserRoundLimit(user, cfg);
     const jobId = db.createJob(user.id, acc.id, null, cfg, cfg.rounds);
     const start = jobs.startRaceJob({ jobId: jobId });
     db.audit(user.id, 'race_run',
@@ -1277,6 +1495,36 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     return sendJson(res, 200, r);
   }
 
+  // 管理员：查看「所有用户」的小猿账号（含明文 Cookie / CK）。
+  // 普通接口的 publicLeoAccount 只回自己且默认隐藏值；这里面向管理员、跨用户、回 CK。
+  if (p === '/api/admin/leo-accounts' && method === 'GET') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const list = db.listAllLeoAccounts().map((a) => ({
+      id: a.id,
+      ownerUserId: a.user_id,
+      ownerUsername: a.owner_username || '(未知)',
+      name: a.name,
+      yfdU: a.yfd_u,
+      grade: a.grade,
+      phoneMasked: db.maskPhone(a.phone),
+      createdAt: a.created_at,
+      updatedAt: a.updated_at,
+      deviceChainId: a.device_chain_id == null ? null : Number(a.device_chain_id),
+      cookieNames: safeCookieNames(a.cookies_json),
+      cookies: safeParseCookies(a.cookies_json),
+      cookieHeader: safeCookieHeader(a.cookies_json),
+      subAccounts: (a.subAccounts || []).map((s) => ({
+        id: s.id,
+        nickname: s.nickname,
+        grade: s.grade,
+        userId: s.user_id,
+        isPrimary: !!s.is_primary,
+      })),
+    }));
+    db.audit(user.id, 'admin_view_all_leo', '查看全部小猿账号 ' + list.length + ' 个', clientIp(req));
+    return sendJson(res, 200, { ok: true, accounts: list });
+  }
+
   const adminUserReset = /^\/api\/admin\/users\/(\d+)\/password$/.exec(p);
   if (adminUserReset && method === 'POST') {
     if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
@@ -1288,6 +1536,18 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     db.setUserPassword(target.id, np);
     db.audit(user.id, 'admin_reset_password', target.username, clientIp(req));
     return sendJson(res, 200, { ok: true });
+  }
+
+  // 管理员：设置某用户的可刷局数上限（0 = 不限制）。用户开任务时按此值钳制 rounds。
+  const adminUserRoundLimit = /^\/api\/admin\/users\/(\d+)\/round-limit$/.exec(p);
+  if (adminUserRoundLimit && method === 'POST') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const b = await readJson(req);
+    const target = db.findUserById(Number(adminUserRoundLimit[1]));
+    if (!target) return sendJson(res, 404, { ok: false, message: '用户不存在' });
+    const v = db.setUserRoundLimit(target.id, b.limit);
+    db.audit(user.id, 'admin_set_round_limit', `${target.username} → ${v === 0 ? '不限' : v + ' 局'}`, clientIp(req));
+    return sendJson(res, 200, { ok: true, limit: v, message: v === 0 ? '已设为不限制' : `已限制为 ${v} 局` });
   }
 
   const adminUserDisable = /^\/api\/admin\/users\/(\d+)\/disable$/.exec(p);
@@ -1345,6 +1605,55 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     });
   }
 
+  /* ------------------------ 在线设备（管理视角） ------------------------ */
+
+  // 全部用户的在线会话（含归属地 / 设备 / 最近活跃），用于管理员监控与强制下线
+  if (p === '/api/admin/sessions' && method === 'GET') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const rows = db.listAllSessions();
+    const ips = rows.map((r) => r.ip).filter(Boolean);
+    let geoMap = {};
+    try { geoMap = await ipgeo.lookupMany(ips, 10); } catch (e) { geoMap = {}; }
+    const sessions = rows.map((r) => {
+      const g = r.ip ? geoMap[r.ip] : null;
+      return {
+        tokenPrefix: r.token.slice(0, 8) + '…',
+        userId: r.user_id,
+        username: r.username || ('#用户' + r.user_id),
+        ip: r.ip,
+        geo: g ? { country: g.country, region: g.region, city: g.city, isp: g.isp } : null,
+        geoText: g ? g.label : '',
+        createdAt: r.created_at,
+        lastSeen: r.last_seen || r.created_at,
+        ua: r.ua || '',
+        device: parseUa(r.ua),
+      };
+    });
+    return sendJson(res, 200, { ok: true, sessions, total: sessions.length });
+  }
+
+  // 管理员强制某用户下线（清其全部会话）；body.ip 可选，只踢该 IP 的会话
+  const adminKick = /^\/api\/admin\/users\/(\d+)\/kick$/.exec(p);
+  if (adminKick && method === 'POST') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const target = db.findUserById(Number(adminKick[1]));
+    if (!target) return sendJson(res, 404, { ok: false, message: '用户不存在' });
+    const b = await readJson(req).catch(() => ({}));
+    let n = 0;
+    if (b.ip) {
+      const rows = db.listSessionsByUser(target.id).filter((r) => r.ip === String(b.ip));
+      for (const r of rows) n += db.deleteSessionOfUser(target.id, r.token);
+    } else {
+      n = db.deleteSessionsByUser(target.id);
+    }
+    db.audit(user.id, 'admin_kick_user',
+      `${target.username} 下线 ${n} 个会话${b.ip ? ' ip=' + b.ip : '（全部）'}`, clientIp(req));
+    return sendJson(res, 200, {
+      ok: true, kicked: n,
+      message: `已让「${target.username}」下线 ${n} 个设备${b.ip ? '（IP ' + b.ip + '）' : ''}`,
+    });
+  }
+
   /* ------------------------ 全部任务（管理视角） ------------------------ */
 
   if (p === '/api/admin/jobs' && method === 'GET') {
@@ -1383,7 +1692,7 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
     const ids = (Array.isArray(b.ids) ? b.ids : []).map(Number).filter((n) => Number.isFinite(n));
     const action = String(b.action || '');
     if (!ids.length) return sendJson(res, 400, { ok: false, message: '请先选择任务' });
-    if (!['stop', 'pause', 'resume'].includes(action)) {
+    if (!['stop', 'pause', 'resume', 'delete'].includes(action)) {
       return sendJson(res, 400, { ok: false, message: '未知操作：' + action });
     }
     const results = [];
@@ -1392,13 +1701,21 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
       const job = db.getJob(id);
       if (!job) { results.push({ id: id, ok: false, message: '任务不存在' }); continue; }
       let r;
-      if (action === 'resume') r = jobs.resumeJob(id);
+      if (action === 'delete') {
+        // 还活着的任务先停（引擎回调才不会写一张已消失的表），再连明细一起删
+        if (['queued', 'running', 'paused'].includes(job.status)) {
+          jobs.stopJob(id, true, { mode: 'stop' });
+        }
+        const n = db.deleteJobsByIds([id]);
+        r = { ok: n > 0, message: n > 0 ? '已删除' : '删除失败' };
+      }
+      else if (action === 'resume') r = jobs.resumeJob(id);
       else r = jobs.stopJob(id, true, { mode: action === 'pause' ? 'pause' : 'stop' });
       if (r.ok) okCount++;
       results.push({ id: id, ok: !!r.ok, message: r.message });
     }
     db.audit(user.id, 'admin_job_' + action, `ids=${ids.join(',')} ok=${okCount}`, clientIp(req));
-    const label = { stop: '停止', pause: '暂停', resume: '继续' }[action];
+    const label = { stop: '停止', pause: '暂停', resume: '继续', delete: '删除' }[action];
     return sendJson(res, 200, {
       ok: okCount > 0, action: action, done: okCount, failed: ids.length - okCount, results: results,
       message: `${label} ${okCount}/${ids.length} 个任务`,
@@ -1408,6 +1725,24 @@ if (p === '/api/link/handshake' || p === '/api/link/accounts') {
   if (p === '/api/admin/audit' && method === 'GET') {
     if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
     return sendJson(res, 200, { ok: true, audit: db.listAudit(300) });
+  }
+
+  // 管理端：所有用户的登录记录（时间 + IP + 用户名）
+  if (p === '/api/admin/login-history' && method === 'GET') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const history = db.listAllLoginHistory(300);
+    await attachGeo(history);
+    return sendJson(res, 200, { ok: true, history });
+  }
+
+  // 管理端：删除登录记录（可跨用户）。ids 为空/不传 = 清空全部登录记录
+  if (p === '/api/admin/login-history' && method === 'DELETE') {
+    if (user.role !== 'admin') return sendJson(res, 403, { ok: false, message: '需要管理员' });
+    const b = await readJson(req).catch(() => ({}));
+    const n = db.deleteLoginHistoryAdmin(b.ids);
+    db.audit(user.id, 'admin_login_history_delete',
+      `删除 ${n} 条（${Array.isArray(b.ids) && b.ids.length ? '选中' : '全部'}）`, clientIp(req));
+    return sendJson(res, 200, { ok: true, deleted: n });
   }
 
   return sendJson(res, 404, { ok: false, message: '未知接口：' + p });
@@ -1423,11 +1758,25 @@ function publicLeoAccount(a) {
     grade: a.grade,
     createdAt: a.created_at,
     updatedAt: a.updated_at,
+    // 手机号脱敏（只露前二后二，永不回明文）
+    phoneMasked: db.maskPhone(a.phone),
     // 该账号「指定使用」的设备链 id；null = 不指定（到时才在池里随机挑一份）
     // 只回 id，label 由页面拿 /api/device-chains 自己配对，避免顺带泄露 cookie 值。
     deviceChainId: a.device_chain_id == null ? null : Number(a.device_chain_id),
     // cookie 只回数量与名字，不回值（避免页面/日志泄露登录态）
     cookieNames: safeCookieNames(a.cookies_json),
+    // 自己的账号：回明文 cookie（前端默认隐藏、点击展开可复制）。
+    // 仅限本人自己的账号，不会跨用户泄露。
+    cookies: safeParseCookies(a.cookies_json),
+    cookieHeader: safeCookieHeader(a.cookies_json),
+    // 子账号（小猿上下文里拉到的关联账号）
+    subAccounts: (a.subAccounts || []).map((s) => ({
+      id: s.id,
+      nickname: s.nickname,
+      grade: s.grade,
+      userId: s.user_id,
+      isPrimary: !!s.is_primary,
+    })),
   };
 }
 
@@ -1437,6 +1786,26 @@ function safeCookieNames(json) {
     return Array.isArray(arr) ? arr.map((c) => c.name) : [];
   } catch (e) {
     return [];
+  }
+}
+
+function safeParseCookies(json) {
+  try {
+    const arr = JSON.parse(json);
+    return Array.isArray(arr)
+      ? arr.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path }))
+      : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function safeCookieHeader(json) {
+  try {
+    const arr = JSON.parse(json);
+    return Array.isArray(arr) ? arr.map((c) => c.name + '=' + c.value).join('; ') : '';
+  } catch (e) {
+    return '';
   }
 }
 
@@ -1522,6 +1891,10 @@ const server = http.createServer(async (req, res) => {
   }
   if (needAdmin(u.pathname) && (!user || user.role !== 'admin')) {
     return sendJson(res, 403, { ok: false, message: '需要管理员' });
+  }
+  // 已登录：刷新会话最近活跃时间（个人中心的「最近活跃」/排序用；失败不影响请求）
+  if (user) {
+    try { db.touchSession(auth.readSessionCookie(req.headers.cookie)); } catch (e) { /* 忽略 */ }
   }
 
   try {

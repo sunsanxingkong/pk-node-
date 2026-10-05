@@ -38,9 +38,12 @@ function register(username, password) {
 /**
  * 登录，成功则签发会话 token。
  *
- * @returns {{ok:boolean, token?:string, user?:object, message?:string}}
+ * @param {string} username
+ * @param {string} password
+ * @param {{ip?:string, ua?:string}} meta 来源 IP / UA（写入会话，供个人中心「多 IP 登录管理」）
+ * @returns {{ok:boolean, token?:string, user?:object, message?:string, sameIpSessions?:number}}
  */
-function login(username, password) {
+function login(username, password, meta = {}) {
   const u = db.findUserByName(String(username || '').trim());
   // 不区分「用户不存在」与「密码错误」，避免用户名枚举。
   if (!u) return { ok: false, message: '用户名或密码错误' };
@@ -48,12 +51,19 @@ function login(username, password) {
   if (!db.verifyPassword(String(password || ''), u.password_hash)) {
     return { ok: false, message: '用户名或密码错误' };
   }
-  const token = db.createSession(u.id);
+  const ip = meta.ip == null ? null : String(meta.ip);
+  // 登录前统计「同 IP 已有会话」数，用于提示多端登录
+  const sameIpSessions = ip
+    ? db.listSessionsByUser(u.id).filter((s) => s.ip === ip).length
+    : 0;
+  const token = db.createSession(u.id, ip, meta.ua);
   db.touchLogin(u.id);
   return {
     ok: true,
     token: token,
     user: { id: u.id, username: u.username, role: u.role },
+    sameIpSessions: sameIpSessions,
+    trustedIp: ip ? db.isTrustedIp(u.id, ip) : false,
   };
 }
 

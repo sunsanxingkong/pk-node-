@@ -211,13 +211,13 @@ async function importAccount(o) {
     : null;
   const targetId = existingId || (byYfdU ? byYfdU.id : null);
   if (targetId) {
-    db.updateLeoAccount(targetId, o.name, cookies, { yfdU: yfdU, grade: grade });
+    db.updateLeoAccount(targetId, o.name, cookies, { yfdU: yfdU, grade: grade, phone: o.phone });
     id = targetId;
     if (byYfdU && !existingId) {
       console.log('[leo] 命中已有账号 yfd_u=' + yfdU + ' → 刷新 id=' + id + '（不新建）');
     }
   } else {
-    id = db.addLeoAccount(o.appUserId, o.name, cookies, { yfdU: yfdU, grade: grade });
+    id = db.addLeoAccount(o.appUserId, o.name, cookies, { yfdU: yfdU, grade: grade, phone: o.phone });
   }
 
   // 把「这次实际用的设备链」钉到账号上：之后跑任务直接复用这份，不再每次随机换。

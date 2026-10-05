@@ -77,6 +77,26 @@ const config = {
   ytkBase: 'https://ape-api.yuanfudao.com',
 
   /**
+   * 小猿（猿辅导系 App）扫码登录。
+   *
+   * ⚠️ 端点为「最佳推测」—— 小猿 App 的扫码登录 API 是闭源、随版本变动的，
+   * 公开资料查不到确切路径。下面按猿辅导系 App 的通用模式填了默认值，
+   * **需要你拿小猿 App 真机抓包校准**（创建二维码 + 轮询状态两个接口及其响应字段）。
+   * 可用环境变量覆盖：PK_QR_CREATE / PK_QR_QUERY。
+   *
+   * 约定（与后端实现一致）：
+   *  - create 成功响应含 `qrKey`（或 qrId/ticket）与 `qrContent`（或 url/content），qrContent 即二维码内容；
+   *  - query 成功响应含 `status`：0 未扫描 / 1 已扫描待确认 / 2 已确认(下发登录态) / 3 过期；
+   *    确认后登录态 cookie 随轮询响应 Set-Cookie 下发，被客户端 jar 吸收后用于导入账号。
+   */
+  qrLogin: {
+    createPath: process.env.PK_QR_CREATE || '/accounts/android/safe/qr/get',
+    queryPath: process.env.PK_QR_QUERY || '/accounts/android/safe/qr/query',
+    pollIntervalMs: 2000,
+    expireMs: 5 * 60 * 1000,
+  },
+
+  /**
    * 真机设备参数（拼 App 原生 UA 用）。
    *
    * 默认值取本机 `getprop` 实测：

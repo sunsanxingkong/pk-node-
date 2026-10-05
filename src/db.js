@@ -61,7 +61,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   token      TEXT PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  ip         TEXT,     -- 登录来源 IP（用于「多 IP 登录 / 踢出其他设备」）
+  last_seen  INTEGER,  -- 最近活跃时间
+  ua         TEXT      -- User-Agent（粗解析出设备/浏览器）
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
@@ -181,7 +184,32 @@ function init() {
   // 补列之后才能建依赖它的索引（放前面会让老库上 SCHEMA 直接失败）
   try {
     db.exec('CREATE INDEX IF NOT EXISTS idx_leo_accounts_chain ON leo_accounts(device_chain_id)');
+    // 登录历史按「用户 + 动作」查（我的登录记录 / 全员登录记录都要走这个条件）
+    db.exec('CREATE INDEX IF NOT EXISTS idx_audit_user_action ON audit(user_id, action)');
   } catch (e) { /* 索引重复/不支持则忽略 */ }
+
+  // 老库补列：小猿账号绑定手机号（短信/密码登录时已知，用于脱敏展示）
+  ensureColumn('leo_accounts', 'phone',
+    'ALTER TABLE leo_accounts ADD COLUMN phone TEXT');
+
+  // 老库补列：每用户可刷局数上限（0 = 不限制；管理员在后台设置）
+  ensureColumn('users', 'round_limit',
+    'ALTER TABLE users ADD COLUMN round_limit INTEGER NOT NULL DEFAULT 0');
+
+  // 老库补列：会话记录 IP / 最近活跃 / UA（个人中心「多 IP 登录 / 踢出其他设备」用）
+  ensureColumn('sessions', 'ip', 'ALTER TABLE sessions ADD COLUMN ip TEXT');
+  ensureColumn('sessions', 'last_seen', 'ALTER TABLE sessions ADD COLUMN last_seen INTEGER');
+  ensureColumn('sessions', 'ua', 'ALTER TABLE sessions ADD COLUMN ua TEXT');
+
+  // 常用 IP 白名单（个人中心）：命中后该 IP 登录可跳过「异地登录提醒/额外校验」
+  db.exec(`CREATE TABLE IF NOT EXISTS trusted_ips (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ip         TEXT    NOT NULL,
+    label      TEXT,
+    created_at INTEGER NOT NULL
+  )`);
+  try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_trusted_ips_uniq ON trusted_ips(user_id, ip)'); } catch (e) { /* 忽略 */ }
 
   // 启动即把历史明文 cookie 迁移为加密（幂等，已加密的会跳过）
   try {
@@ -239,8 +267,16 @@ function setUserDisabled(id, disabled) {
 
 function listUsers() {
   return get()
-    .prepare('SELECT id, username, role, disabled, created_at, last_login_at FROM users ORDER BY id')
+    .prepare('SELECT id, username, role, disabled, created_at, last_login_at, round_limit FROM users ORDER BY id')
     .all();
+}
+
+/** 设置某用户的可刷局数上限（0 = 不限制）。 */
+function setUserRoundLimit(id, limit) {
+  const n = Number(limit);
+  const v = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  get().prepare('UPDATE users SET round_limit = ? WHERE id = ?').run(v, Number(id));
+  return v;
 }
 
 /** 管理员人数（用于「不能删掉最后一个管理员」的保护）。 */
@@ -265,13 +301,49 @@ function touchLogin(id) {
 
 /* ------------------------------ 会话 ------------------------------ */
 
-function createSession(userId) {
+function createSession(userId, ip, ua) {
   const token = crypto.randomBytes(24).toString('hex');
   const now = Date.now();
   get()
-    .prepare('INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?,?,?,?)')
-    .run(token, Number(userId), now, now + config.sessionTtlMs);
+    .prepare('INSERT INTO sessions (token, user_id, created_at, expires_at, ip, last_seen, ua) VALUES (?,?,?,?,?,?,?)')
+    .run(token, Number(userId), now, now + config.sessionTtlMs,
+      ip == null ? null : String(ip), now, ua == null ? null : String(ua).slice(0, 300));
   return token;
+}
+
+/** 该用户的所有未过期会话（带 IP / 最近活跃 / UA），最新在前。 */
+function listSessionsByUser(userId) {
+  return get()
+    .prepare(`SELECT token, user_id, created_at, expires_at, ip, last_seen, ua
+              FROM sessions WHERE user_id = ? AND expires_at >= ?
+              ORDER BY last_seen DESC, created_at DESC`)
+    .all(Number(userId), Date.now());
+}
+
+/** 管理员用：全部用户的未过期会话（带回用户名），最近活跃在前。 */
+function listAllSessions(limit = 500) {
+  return get()
+    .prepare(`SELECT s.token, s.user_id, u.username, s.ip, s.created_at, s.expires_at, s.last_seen, s.ua
+              FROM sessions s LEFT JOIN users u ON u.id = s.user_id
+              WHERE s.expires_at >= ?
+              ORDER BY s.last_seen DESC, s.created_at DESC LIMIT ?`)
+    .all(Date.now(), Number(limit));
+}
+
+/** 删除「某用户」的「某个 token」（个人中心踢设备用；带 user_id 防越权踢别人）。 */
+function deleteSessionOfUser(userId, token) {
+  const info = get()
+    .prepare('DELETE FROM sessions WHERE user_id = ? AND token = ?')
+    .run(Number(userId), String(token));
+  return Number(info.changes) || 0;
+}
+
+/** 刷新会话最近活跃时间（每次请求打一下，用于排序与「在线」判断）。 */
+function touchSession(token) {
+  if (!token) return;
+  try {
+    get().prepare('UPDATE sessions SET last_seen = ? WHERE token = ?').run(Date.now(), String(token));
+  } catch (e) { /* 刷新失败不影响请求 */ }
 }
 
 function getUserBySession(token) {
@@ -308,8 +380,8 @@ function addLeoAccount(userId, name, cookies, extra = {}) {
   const now = Date.now();
   const info = get()
     .prepare(
-      `INSERT INTO leo_accounts (user_id, name, cookies_json, yfd_u, grade, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?)`,
+      `INSERT INTO leo_accounts (user_id, name, cookies_json, yfd_u, grade, phone, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
     )
     .run(
       Number(userId),
@@ -317,6 +389,7 @@ function addLeoAccount(userId, name, cookies, extra = {}) {
       JSON.stringify(cookiecrypt.encryptItems(cookies)),
       extra.yfdU == null ? null : String(extra.yfdU),
       extra.grade == null ? null : Number(extra.grade),
+      extra.phone == null ? null : String(extra.phone),
       now,
       now,
     );
@@ -357,13 +430,14 @@ function updateLeoAccount(id, name, cookies, extra = {}) {
   get()
     .prepare(
       `UPDATE leo_accounts SET name = ?, cookies_json = ?, yfd_u = COALESCE(?, yfd_u),
-         grade = COALESCE(?, grade), updated_at = ? WHERE id = ?`,
+         grade = COALESCE(?, grade), phone = COALESCE(?, phone), updated_at = ? WHERE id = ?`,
     )
     .run(
       String(name),
       JSON.stringify(cookiecrypt.encryptItems(cookies)),
       extra.yfdU == null ? null : String(extra.yfdU),
       extra.grade == null ? null : Number(extra.grade),
+      extra.phone == null ? null : String(extra.phone),
       Date.now(),
       Number(id),
     );
@@ -377,10 +451,35 @@ function decryptAccountRow(row) {
   const plain = cookiecrypt.decryptItems(items);
   return Object.assign({}, row, { cookies_json: JSON.stringify(plain) });
 }
+
+/**
+ * 手机号脱敏：只保留前 2 位与后 2 位，中间一律 `*`。
+ * 例：13800138000 → 13*******00。非手机号（位数不足 4）原样返回，空值返回 null。
+ */
+function maskPhone(raw) {
+  if (raw == null) return null;
+  const p = String(raw).replace(/\D/g, '');
+  if (p.length < 4) return p || null;
+  return p.slice(0, 2) + '*'.repeat(p.length - 4) + p.slice(-2);
+}
 function listLeoAccounts(userId) {
   return get()
     .prepare('SELECT * FROM leo_accounts WHERE user_id = ? ORDER BY id DESC')
-    .all(Number(userId)).map(decryptAccountRow);
+    .all(Number(userId))
+    .map(decryptAccountRow)
+    .map((a) => Object.assign(a, { subAccounts: listSubAccounts(a.id) }));
+}
+
+/** 管理员用：返回全部用户的小猿账号（带回属主用户名），用于「查看所有用户的小猿账号」。 */
+function listAllLeoAccounts() {
+  return get()
+    .prepare(`SELECT la.*, u.username AS owner_username
+              FROM leo_accounts la
+              LEFT JOIN users u ON u.id = la.user_id
+              ORDER BY la.user_id, la.id DESC`)
+    .all()
+    .map(decryptAccountRow)
+    .map((a) => Object.assign(a, { subAccounts: listSubAccounts(a.id) }));
 }
 
 function getLeoAccount(id) {
@@ -709,6 +808,109 @@ function listAudit(limit = 200) {
     .all(Number(limit));
 }
 
+/* --------------------------- 登录记录 --------------------------- */
+/**
+ * 我的登录记录：登录成功 + 登录失败都算（失败也带 IP，用户能看到是谁在试自己的号）。
+ * action='login' 由 /api/auth/login 写入：detail '成功' 或 '失败:<用户名>'。
+ */
+function listLoginHistory(userId, limit = 100) {
+  return get()
+    .prepare(`SELECT id, action, detail, ip, created_at FROM audit
+              WHERE user_id = ? AND action = 'login'
+              ORDER BY id DESC LIMIT ?`)
+    .all(Number(userId), Number(limit));
+}
+
+/** 管理员用：所有用户的登录记录（带回用户名）。 */
+function listAllLoginHistory(limit = 300) {
+  return get()
+    .prepare(`SELECT a.id, a.user_id, u.username, a.detail, a.ip, a.created_at
+              FROM audit a LEFT JOIN users u ON u.id = a.user_id
+              WHERE a.action = 'login'
+              ORDER BY a.id DESC LIMIT ?`)
+    .all(Number(limit));
+}
+
+/* --------------------------- 常用 IP（白名单） --------------------------- */
+/** 该用户的常用 IP 列表。 */
+function listTrustedIps(userId) {
+  return get()
+    .prepare('SELECT id, ip, label, created_at FROM trusted_ips WHERE user_id = ? ORDER BY id DESC')
+    .all(Number(userId));
+}
+
+/** 加一个常用 IP（按 user_id+ip 去重，重复则更新备注）。 */
+function addTrustedIp(userId, ip, label) {
+  get()
+    .prepare(`INSERT INTO trusted_ips (user_id, ip, label, created_at) VALUES (?,?,?,?)
+              ON CONFLICT(user_id, ip) DO UPDATE SET label = excluded.label`)
+    .run(Number(userId), String(ip), label == null ? null : String(label), Date.now());
+  return get().prepare('SELECT id FROM trusted_ips WHERE user_id = ? AND ip = ?')
+    .get(Number(userId), String(ip)).id;
+}
+
+/** 删一个常用 IP（带 user_id 防越权）。 */
+function deleteTrustedIp(userId, id) {
+  const info = get().prepare('DELETE FROM trusted_ips WHERE user_id = ? AND id = ?')
+    .run(Number(userId), Number(id));
+  return Number(info.changes) || 0;
+}
+
+/** 判断某 IP 是否在该用户的常用 IP 里。 */
+function isTrustedIp(userId, ip) {
+  const r = get().prepare('SELECT 1 AS y FROM trusted_ips WHERE user_id = ? AND ip = ? LIMIT 1')
+    .get(Number(userId), String(ip));
+  return !!(r && r.y);
+}
+
+/** 删除该用户自己的登录记录（可选按 id 列表；不传则全清）。返回删除条数。 */
+function deleteLoginHistory(userId, ids) {
+  const list = (Array.isArray(ids) ? ids : []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+  if (!list.length) {
+    const info = get().prepare("DELETE FROM audit WHERE user_id = ? AND action = 'login'").run(Number(userId));
+    return Number(info.changes) || 0;
+  }
+  const ph = list.map(() => '?').join(',');
+  const info = get()
+    .prepare(`DELETE FROM audit WHERE user_id = ? AND action = 'login' AND id IN (${ph})`)
+    .run(Number(userId), ...list);
+  return Number(info.changes) || 0;
+}
+
+/**
+ * 管理员用：删除登录记录（可跨用户）。ids 为空 = 清空全部登录记录。
+ * 只删 action='login'，不碰其它审计条目。
+ * @returns {number} 删除条数
+ */
+function deleteLoginHistoryAdmin(ids) {
+  const list = (Array.isArray(ids) ? ids : []).map(Number).filter((n) => Number.isFinite(n) && n > 0);
+  if (!list.length) {
+    const info = get().prepare("DELETE FROM audit WHERE action = 'login'").run();
+    return Number(info.changes) || 0;
+  }
+  const ph = list.map(() => '?').join(',');
+  const info = get().prepare(`DELETE FROM audit WHERE action = 'login' AND id IN (${ph})`).run(...list);
+  return Number(info.changes) || 0;
+}
+
+/* --------------------------- 任务删除 --------------------------- */
+/**
+ * 批量删除任务（连同轮次明细）。job_rounds 虽声明了 ON DELETE CASCADE，
+ * 但 better/node sqlite 默认不开外键，必须先手动清子表。
+ * 进行中的任务由调用方（server 层）先 stopJob，再进来删。
+ * @returns {number} 实际删掉的任务条数
+ */
+function deleteJobsByIds(ids) {
+  const list = (Array.isArray(ids) ? ids : [])
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (!list.length) return 0;
+  const ph = list.map(() => '?').join(',');
+  get().prepare(`DELETE FROM job_rounds WHERE job_id IN (${ph})`).run(...list);
+  const r = get().prepare(`DELETE FROM jobs WHERE id IN (${ph})`).run(...list);
+  return Number(r.changes);
+}
+
 module.exports = {
   init,
   get,
@@ -720,6 +922,7 @@ module.exports = {
   setUserPassword,
   setUserDisabled,
   listUsers,
+  setUserRoundLimit,
   countAdmins,
   countLeoAccountsOfUser,
   deleteUser,
@@ -729,6 +932,16 @@ module.exports = {
   deleteSession,
   deleteSessionsByUser,
   purgeExpiredSessions,
+  listSessionsByUser,
+  listAllSessions,
+  deleteSessionOfUser,
+  touchSession,
+  listTrustedIps,
+  addTrustedIp,
+  deleteTrustedIp,
+  isTrustedIp,
+  deleteLoginHistory,
+  deleteLoginHistoryAdmin,
   migrateCookieEncryption,
   addDeviceChain,
   listDeviceChains,
@@ -742,11 +955,13 @@ module.exports = {
   updateLeoAccount,
   findLeoAccountByYfdU,
   listLeoAccounts,
+  listAllLeoAccounts,
   getLeoAccount,
   deleteLeoAccount,
   replaceSubAccounts,
   listSubAccounts,
   getSubAccount,
+  maskPhone,
   createJob,
   setJobStatus,
   addJobRound,
@@ -760,4 +975,7 @@ module.exports = {
   kvSet,
   audit,
   listAudit,
+  listLoginHistory,
+  listAllLoginHistory,
+  deleteJobsByIds,
 };

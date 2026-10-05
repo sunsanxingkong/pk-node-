@@ -222,6 +222,7 @@ async function persistAccount(o) {
     appUserId: o.appUserId,
     name: name,
     cookieText: cookieText,
+    phone: o.phone,
   });
 
   if (!res.ok) return { ok: false, message: '登录成功但导入失败：' + res.message };

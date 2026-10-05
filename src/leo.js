@@ -464,6 +464,66 @@ async function ytkPasswordLogin(jar, phonePlain, passwordEncrypted) {
   return { status: r.status, json: safeJson(r.text), text: r.text, headers: r.headers };
 }
 
+/**
+ * 扫码登录 · 创建二维码。
+ * ⚠️ 端点来自 config.qrLogin.createPath（最佳推测，需真机抓包校准）。
+ *
+ * 调用后服务端返回一张待扫二维码：
+ *  - `qrKey`：本次扫码会话的唯一 id（轮询时回传）；
+ *  - `qrContent`：二维码里编码的内容（通常是登录用 URL/令牌），前端据此渲染二维码。
+ *
+ * @returns {Promise<{ok:boolean, qrKey?:string, qrContent?:string, message?:string}>}
+ */
+async function ytkQrCreate(jar) {
+  const r = await request({
+    url: config.ytkBase + config.qrLogin.createPath,
+    method: 'POST',
+    jar: jar || undefined,
+    headers: ytkHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({}),
+  });
+  const j = safeJson(r.text);
+  const pick = (o, ks) => (o ? ks.map((k) => o[k]).find((v) => v != null) : undefined);
+  const qrKey = pick(j, ['qrKey', 'qrId', 'qrcode', 'ticket', 'qrToken'])
+    || pick(j && j.data, ['qrKey', 'qrId', 'qrcode', 'ticket', 'qrToken']);
+  const qrContent = pick(j, ['qrContent', 'url', 'content', 'qrcodeUrl', 'qrUrl'])
+    || pick(j && j.data, ['qrContent', 'url', 'content', 'qrcodeUrl', 'qrUrl']);
+  if (!qrKey) {
+    return {
+      ok: false,
+      message: '二维码创建失败（端点/响应字段不匹配，需校准 config.qrLogin）：HTTP ' + r.status
+        + ' body=' + (r.text || '').slice(0, 240),
+    };
+  }
+  return { ok: true, qrKey: String(qrKey), qrContent: qrContent != null ? String(qrContent) : String(qrKey) };
+}
+
+/**
+ * 扫码登录 · 轮询状态。
+ * ⚠️ 端点来自 config.qrLogin.queryPath（最佳推测，需真机抓包校准）。
+ *
+ * 状态机（与前端约定）：0 未扫描 / 1 已扫描待确认 / 2 已确认(下发登录态) / 3 过期。
+ * 确认后登录态 cookie 随本响应 Set-Cookie 下发，被传入的 jar 自动吸收（见 http.js）。
+ *
+ * @returns {Promise<{status:number, ok:boolean, raw?:any}>}
+ */
+async function ytkQrPoll(jar, qrKey) {
+  const r = await request({
+    url: config.ytkBase + config.qrLogin.queryPath + '?qrKey=' + encodeURIComponent(qrKey),
+    method: 'GET',
+    jar: jar || undefined,
+    headers: ytkHeaders(),
+  });
+  const j = safeJson(r.text);
+  let status = -1;
+  if (j) {
+    if (typeof j.status === 'number') status = j.status;
+    else if (j.data && typeof j.data.status === 'number') status = j.data.status;
+    else if (j.code === 0 && j.data) status = 2; // 通用成功码
+  }
+  return { status, ok: status === 2, raw: j };
+}
+
 function safeJson(text) {
   try { return JSON.parse(text); } catch (e) { return null; }
 }
@@ -490,5 +550,7 @@ module.exports = {
   ytkSmsVerify,
   ytkSmsLogin,
   ytkPasswordLogin,
+  ytkQrCreate,
+  ytkQrPoll,
   CookieJar,
 };

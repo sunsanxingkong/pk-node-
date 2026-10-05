@@ -106,9 +106,16 @@ function isRateLimited(status, text) {
   return t.includes('频繁') || t.includes('rate') || t.includes('blocked');
 }
 
-/** 频控等待时长：base × 2^n，n 从 0 开始。 */
+/**
+ * 频控等待时长：base × 2^n，n 从 0 开始，再叠加 ±20% 随机抖动。
+ *
+ * 为什么要抖动：固定间隔的重试会与风控窗口「同频」，多轮下来反而更像机器、
+ * 更容易被继续拦；加抖动把重试打散，既降低再次撞窗口的概率，也更像真人节奏。
+ */
 function backoffMs(attempt) {
-  return PK.rateLimitBaseMs * Math.pow(2, Math.max(0, attempt));
+  const base = PK.rateLimitBaseMs * Math.pow(2, Math.max(0, attempt));
+  const jitter = 0.8 + Math.random() * 0.4;   // 0.8 ~ 1.2
+  return Math.round(base * jitter);
 }
 
 /**
