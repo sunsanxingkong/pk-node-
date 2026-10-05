@@ -79,64 +79,52 @@ function start(port) {
     let settled = false;
     const done = (r) => { if (!settled) { settled = true; resolve(r); } };
 
-    // ★★ 2026-10-05（Android 真机修正）：cloudflared 是 **Go 静态链接**程序，
-    // 它的 DNS 解析器**纯 Go 实现**，在 Linux 上只读 `/etc/resolv.conf`：
+    // ★★★ 2026-10-05 定案：DNS 问题**已在二进制层面解决**，这里无需任何 hack。
     //
-    //   · Android **没有** `/etc/resolv.conf`（`/etc` 是 `/system/etc` 只读软链，
-    //     且 `/` 是 erofs 只读 —— **连 root 都 remount 不了**，已实测）；
-    //   · Go **不读** Android 的 `net.dns1` 属性（那是 bionic/Java 层的机制）；
-    //   · 于是它退化成「去本机 53 端口查」，而 netd 并不监听那里 ——
-    //     报错就是：`lookup api.trycloudflare.com on [::1]:53: connection refused`。
+    // ## 历史（三条死路，别再走）
     //
-    // 前一版我试图「写一份 resolv.conf」——**写不进去**，这条路是死的。
-    // `--edge-ip-version 4` 也只是把 `::1` 换成 `127.0.0.1`，本机依旧没人监听 53。
+    // cloudflared 官方 `linux-arm64` 是 **GOOS=linux 纯静态**构建，DNS 用 Go 自己的
+    // resolver，**只读 `/etc/resolv.conf`** —— 而 Android 没有这个文件（`/` 是 erofs
+    // 只读、`/etc` 是只读软链，**连 root 都 remount 不了**）。它于是退化到查本机 `:53`：
+    //   `lookup api.trycloudflare.com on [::1]:53: connection refused`
     //
-    // ## 正解：让 Node 代替它做 DNS
+    // 为此走过的三条死路（**全部实测失败**）：
+    //   ① 写 `/etc/resolv.conf` —— 只读分区，写不进去；
+    //   ② `--dns-resolver-addrs` / `TUNNEL_DNS_RESOLVER_ADDRS` —— 只作用于
+    //      `tunnel run`（命名隧道），**对 quick tunnel 无效**（实测仍报原错误）；
+    //   ③ `HTTPS_PROXY` + 自建 CONNECT 代理 —— cloudflared **不遵循任何代理环境变量**
+    //      （给它一个必然连不上的坏代理，它照样成功 ⇒ 那条代码路径根本没走）。
     //
-    // 内置 Node 的 DNS 是好的（走 `getaddrinfo()` → bionic → netd）。
-    // 而 Go 的 HTTP 客户端**尊重 `HTTPS_PROXY`** 且对 HTTPS 目标发 CONNECT。
-    // 于是在本机起一个极小 CONNECT 代理（[./dns-proxy]），
-    // **域名解析由 Node 完成**，Go 侧完全不参与 —— 问题从根上消失。
-    // 不需要 root、不改系统文件、不需要重新编译 cloudflared。
-    ensureDnsProxy().then((proxy) => {
-      // ★ `--protocol http2` 是**必须的**：cloudflared 默认 `auto`，很可能选 **QUIC**，
-      //   而 QUIC 跑在 **UDP** 上 —— HTTP CONNECT 代理只支持 TCP（Go 的
-      //   `HTTPS_PROXY` 也只作用于 TCP/TLS）。走 QUIC 的话它会绕过代理直连，
-      //   于是又要自己解析域名 → 回到原来的失败。
-      //   强制 http2 后所有出站都是 TCP/TLS，全部经由代理。
-      const args = [
-        'tunnel', '--url', target, '--no-autoupdate',
-        '--edge-ip-version', '4',
-        '--protocol', 'http2',
-      ];
-      const env = { ...process.env };
-      if (proxy) {
-        // Go 读 HTTPS_PROXY；http_proxy/HTTP_PROXY 一并设上，覆盖不同代码路径。
-        const p = 'http://127.0.0.1:' + proxy.port;
-        env.HTTPS_PROXY = p;
-        env.https_proxy = p;
-        env.HTTP_PROXY = p;
-        env.http_proxy = p;
-        // ★ 关键：清空 NO_PROXY —— 否则 Go 可能对某些目标（含本机/私网）直连，
-        //   那些目标又会走它自己的 DNS。
-        env.NO_PROXY = '';
-        env.no_proxy = '';
-        pushLog('DNS 代理已启用：' + p + '（由 Node 代 Go 解析域名）');
-      } else {
-        pushLog('⚠ DNS 代理未启动，cloudflared 可能因无法解析域名而失败');
-      }
-      spawnTunnel(av, args, env, done);
-    }).catch((e) => {
-      pushLog('⚠ DNS 代理启动异常：' + e.message);
-      spawnTunnel(av, args, { ...process.env }, done);
-    });
+    // ## 正解（已落地在 `bin/get-cloudflared.sh`）
+    //
+    // 换成 **Termux 的 `GOOS=android` 构建**：它的 DNS 走 bionic 的 `getaddrinfo`
+    // → netd 的 `dnsproxyd` socket（`/dev/socket/dnsproxyd` 属 `inet` 组，
+    // **所有 App 都在这个组里**）⇒ **不需要 root、不需要改系统文件、任何设备都能用**。
+    // 这正是「Termux 里不 root 也能用」的原因。
+    //
+    // 所以这里只管启动，DNS 交给二进制自己（它知道怎么问 Android）。
+    const args = [
+      'tunnel', '--url', target, '--no-autoupdate',
+      // 避免优先走 IPv6（部分网络下 IPv6 到 Cloudflare 边缘不稳）。
+      '--edge-ip-version', '4',
+      // QUIC 默认 `auto` 可能选 UDP；http2 走 TCP 更可靠。
+      '--protocol', 'http2',
+    ];
+    // 环境变量：把代理相关全清掉（避免上层环境里残留的代理影响直连）。
+    const env = { ...process.env };
+    for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) {
+      delete env[k];
+    }
+    spawnTunnel(av, args, env, done);
   });
 }
+
+
 
 /**
  * 启动 cloudflared 进程并解析输出。
  *
- * 抽出来是因为它现在被两条路径调用（有/无 DNS 代理），避免重复。
+ * 抽出来是为了让 start() 的流程更清晰（参数/环境准备 vs 进程与输出）。
  */
 function spawnTunnel(av, args, env, done) {
     const proc = spawn(av.path, args, {
@@ -154,8 +142,8 @@ function spawnTunnel(av, args, env, done) {
         if (m && !state.url) {
           state.url = m[1];
           done({ ok: true, url: state.url });
-        }
       }
+    }
     };
     proc.stdout.on('data', onChunk);
     proc.stderr.on('data', onChunk);
@@ -179,25 +167,6 @@ function spawnTunnel(av, args, env, done) {
     }, 20000);
 }
 
-/** 已启动的 DNS 代理（进程级单例）。 */
-let dnsProxy = null;
-
-/**
- * 按需启动 DNS 代理（只启一次）。
- *
- * @returns {Promise<{port:number}|null>} null = 启动失败（此时退回直连，行为与旧版一致）
- */
-function ensureDnsProxy() {
-  if (dnsProxy) return Promise.resolve(dnsProxy);
-  return Promise.resolve()
-    .then(() => require('./dns-proxy').create({ onLog: (l) => pushLog('[dns] ' + l) }))
-    .then((p) => { dnsProxy = p; return p; })
-    .catch((e) => {
-      pushLog('[dns] 代理启动失败：' + e.message);
-      return null;
-    });
-}
-
 /** 停止隧道。 */
 function stop() {
   if (state.proc && state.proc.exitCode == null) {
@@ -211,10 +180,9 @@ function stop() {
 
 module.exports = { available, status, start, stop };
 
-// ★ 2026-10-05：原 `ensureResolvConf()` 已删除。
+// ★ 2026-10-05：本文件曾尝试过三种 DNS 绕过方案（写 resolv.conf / HTTPS_PROXY 代理 /
+// `--dns-resolver-addrs`），**全部实测失败**（原因见 start() 里的完整记录）。
 //
-// 它尝试「读 Android 的 net.dns1 属性 → 写一份 resolv.conf」，但真机实测：
-//   · `/` 是 erofs **只读**，`/etc` 是 `/system/etc` 的只读软链 —— 连 root 都写不进去；
-//   · 写到临时目录也没用 —— **Go 不支持指定 resolv.conf 路径**（只读 /etc）。
-// 所以那条路是死的。现改为 `dns-proxy.js`（Node 侧 CONNECT 代理），
-// 让 Node 用 bionic 的 `getaddrinfo()` 代 Go 解析域名，见本文件 start() 的说明。
+// 最终方案在**二进制层面**：把 cloudflared 换成 Termux 的 `GOOS=android` 构建
+// （DNS 走 bionic → netd，App 天生可用）。下载/换装脚本：`bin/get-cloudflared.sh`。
+// 所以 `src/tunnel.js` 现在很干净 —— 只管启动，不碰 DNS。
