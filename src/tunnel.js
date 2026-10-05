@@ -79,24 +79,66 @@ function start(port) {
     let settled = false;
     const done = (r) => { if (!settled) { settled = true; resolve(r); } };
 
-    // ★★ 2026-10-05（Android 真机修正）：cloudflared 是 **Go 程序**，
-    // 它的 DNS 解析器不读 Android 的 `net.dns1` 属性（那是 Java 层用的），
-    // 而只读 **`/etc/resolv.conf`** —— 而 Android **没有这个文件**。
-    // 于是它退化到本机 `[::1]:53` 去查 DNS，必然：
+    // ★★ 2026-10-05（Android 真机修正）：cloudflared 是 **Go 静态链接**程序，
+    // 它的 DNS 解析器**纯 Go 实现**，在 Linux 上只读 `/etc/resolv.conf`：
     //
-    //   dial tcp: lookup api.trycloudflare.com on [::1]:53: read udp ...: connection refused
+    //   · Android **没有** `/etc/resolv.conf`（`/etc` 是 `/system/etc` 只读软链，
+    //     且 `/` 是 erofs 只读 —— **连 root 都 remount 不了**，已实测）；
+    //   · Go **不读** Android 的 `net.dns1` 属性（那是 bionic/Java 层的机制）；
+    //   · 于是它退化成「去本机 53 端口查」，而 netd 并不监听那里 ——
+    //     报错就是：`lookup api.trycloudflare.com on [::1]:53: connection refused`。
     //
-    // 修法：读 Android 的 DNS 属性，写一份临时 resolv.conf，
-    // 用 `--edge-ip-version 4` **强制 IPv4**（避免又走回 IPv6 那条死路）。
-    const resolv = ensureResolvConf();
-    const args = ['tunnel', '--url', target, '--no-autoupdate', '--edge-ip-version', '4'];
-    // ★ Go 的 net 包会读 `RES_OPTIONS`，但不能指定文件路径；
-    //   能改的只有「把 resolv.conf 放到它会读的地方」——对 Android 就是 `/etc`。
-    //   若权限不允许写 `/etc`，退而用 `GODEBUG=netdns=go` + 自建 rootfs
-    //   的方式（见 ensureResolvConf 的注释）。
-    const env = { ...process.env };
-    if (resolv.dir) env.RESOLV_CONF_DIR = resolv.dir;
+    // 前一版我试图「写一份 resolv.conf」——**写不进去**，这条路是死的。
+    // `--edge-ip-version 4` 也只是把 `::1` 换成 `127.0.0.1`，本机依旧没人监听 53。
+    //
+    // ## 正解：让 Node 代替它做 DNS
+    //
+    // 内置 Node 的 DNS 是好的（走 `getaddrinfo()` → bionic → netd）。
+    // 而 Go 的 HTTP 客户端**尊重 `HTTPS_PROXY`** 且对 HTTPS 目标发 CONNECT。
+    // 于是在本机起一个极小 CONNECT 代理（[./dns-proxy]），
+    // **域名解析由 Node 完成**，Go 侧完全不参与 —— 问题从根上消失。
+    // 不需要 root、不改系统文件、不需要重新编译 cloudflared。
+    ensureDnsProxy().then((proxy) => {
+      // ★ `--protocol http2` 是**必须的**：cloudflared 默认 `auto`，很可能选 **QUIC**，
+      //   而 QUIC 跑在 **UDP** 上 —— HTTP CONNECT 代理只支持 TCP（Go 的
+      //   `HTTPS_PROXY` 也只作用于 TCP/TLS）。走 QUIC 的话它会绕过代理直连，
+      //   于是又要自己解析域名 → 回到原来的失败。
+      //   强制 http2 后所有出站都是 TCP/TLS，全部经由代理。
+      const args = [
+        'tunnel', '--url', target, '--no-autoupdate',
+        '--edge-ip-version', '4',
+        '--protocol', 'http2',
+      ];
+      const env = { ...process.env };
+      if (proxy) {
+        // Go 读 HTTPS_PROXY；http_proxy/HTTP_PROXY 一并设上，覆盖不同代码路径。
+        const p = 'http://127.0.0.1:' + proxy.port;
+        env.HTTPS_PROXY = p;
+        env.https_proxy = p;
+        env.HTTP_PROXY = p;
+        env.http_proxy = p;
+        // ★ 关键：清空 NO_PROXY —— 否则 Go 可能对某些目标（含本机/私网）直连，
+        //   那些目标又会走它自己的 DNS。
+        env.NO_PROXY = '';
+        env.no_proxy = '';
+        pushLog('DNS 代理已启用：' + p + '（由 Node 代 Go 解析域名）');
+      } else {
+        pushLog('⚠ DNS 代理未启动，cloudflared 可能因无法解析域名而失败');
+      }
+      spawnTunnel(av, args, env, done);
+    }).catch((e) => {
+      pushLog('⚠ DNS 代理启动异常：' + e.message);
+      spawnTunnel(av, args, { ...process.env }, done);
+    });
+  });
+}
 
+/**
+ * 启动 cloudflared 进程并解析输出。
+ *
+ * 抽出来是因为它现在被两条路径调用（有/无 DNS 代理），避免重复。
+ */
+function spawnTunnel(av, args, env, done) {
     const proc = spawn(av.path, args, {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -135,7 +177,25 @@ function start(port) {
     setTimeout(() => {
       done({ ok: !!state.url, url: state.url, message: state.url ? undefined : '等待公网地址超时（20s），请看日志' });
     }, 20000);
-  });
+}
+
+/** 已启动的 DNS 代理（进程级单例）。 */
+let dnsProxy = null;
+
+/**
+ * 按需启动 DNS 代理（只启一次）。
+ *
+ * @returns {Promise<{port:number}|null>} null = 启动失败（此时退回直连，行为与旧版一致）
+ */
+function ensureDnsProxy() {
+  if (dnsProxy) return Promise.resolve(dnsProxy);
+  return Promise.resolve()
+    .then(() => require('./dns-proxy').create({ onLog: (l) => pushLog('[dns] ' + l) }))
+    .then((p) => { dnsProxy = p; return p; })
+    .catch((e) => {
+      pushLog('[dns] 代理启动失败：' + e.message);
+      return null;
+    });
 }
 
 /** 停止隧道。 */
@@ -151,62 +211,10 @@ function stop() {
 
 module.exports = { available, status, start, stop };
 
-
-/**
- * 为 cloudflared（Go）准备一份可用的 `resolv.conf`。
- *
- * # 为什么需要（Android 特有）
- *
- * Go 的 DNS 解析器在 Linux 上默认读 `/etc/resolv.conf`；
- * Android **没有这个文件**（它把 DNS 放在 `net.dns*` 系统属性里，只给 Java 层用）。
- * 于是 Go 程序只能去本机 `127.0.0.1:53` / `[::1]:53` 碰运气
- * —— 而 Android 的 netd 并不在那里监听，必然 connection refused。
- *
- * # 做法
- *
- * 1. 从 `getprop` 读出真实的 DNS 地址（`net.dns1` 等）；
- * 2. 优先尝试写入 `/etc/resolv.conf`（需要 root；普通 App 不行）；
- * 3. 不行就写到一个临时目录，并把该目录告诉 cloudflared（虽然 Go 不一定读，
- *    但至少为后续留了钩子）。
- *
- * @returns {{dir: string|null}} 写入目录（null = 都没成功）
- */
-function ensureResolvConf() {
-  try {
-    const { execFileSync } = require('node:child_process');
-    // Android 的 DNS 地址在 net.* 属性里；同时兼顾普通 Linux（/etc/resolv.conf 已存在）。
-    let servers = [];
-    for (const prop of ['net.dns1', 'net.dns2', 'net.dns3', 'net.dns4']) {
-      try {
-        const v = execFileSync('getprop', [prop], { encoding: 'utf8' }).trim();
-        if (v && /^[0-9a-fA-F:.]+$/.test(v)) servers.push(v);
-      } catch (_) { /* 忽略 */ }
-    }
-    if (!servers.length) {
-      // 非 Android：直接用系统现成的
-      if (fs.existsSync('/etc/resolv.conf')) return { dir: null, existing: true };
-      // 兼容常见网关作 DNS 的情况
-      servers = ['1.1.1.1', '8.8.8.8'];
-    }
-    const body =
-      '# 由 pk-node 自动生成（Android 没有 resolv.conf，Go 需要它）\n' +
-      servers.map((s) => 'nameserver ' + s).join('\n') + '\n';
-
-    // 优先 /etc（Go 默认就读它）。
-    for (const target of ['/etc/resolv.conf']) {
-      try {
-        fs.writeFileSync(target, body, { mode: 0o644 });
-        return { dir: null, written: target, servers };
-      } catch (_) { /* 权限不够，继续 */ }
-    }
-
-    // 退而求其次：写到自己的目录（为后续留钩子）。
-    const dir = path.join(ROOT, 'data');
-    fs.mkdirSync(dir, { recursive: true });
-    const f = path.join(dir, 'resolv.conf');
-    fs.writeFileSync(f, body, { mode: 0o644 });
-    return { dir, written: f, servers };
-  } catch (e) {
-    return { dir: null, error: e.message };
-  }
-}
+// ★ 2026-10-05：原 `ensureResolvConf()` 已删除。
+//
+// 它尝试「读 Android 的 net.dns1 属性 → 写一份 resolv.conf」，但真机实测：
+//   · `/` 是 erofs **只读**，`/etc` 是 `/system/etc` 的只读软链 —— 连 root 都写不进去；
+//   · 写到临时目录也没用 —— **Go 不支持指定 resolv.conf 路径**（只读 /etc）。
+// 所以那条路是死的。现改为 `dns-proxy.js`（Node 侧 CONNECT 代理），
+// 让 Node 用 bionic 的 `getaddrinfo()` 代 Go 解析域名，见本文件 start() 的说明。
