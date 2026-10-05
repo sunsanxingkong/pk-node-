@@ -137,6 +137,11 @@ const state = {
   practiceStream: null,
   /** 当前正在看的「刷练习」任务 id（后台任务）。 */
   practiceJobId: null,
+  /** 竞速日志流与任务 id（与练习同款）。 */
+  raceStream: null,
+  raceJobId: null,
+  /** 最近一次竞速「获取知识点」缓存的 home 数据（榜单查询要用 pointId）。 */
+  raceHome: null,
   /** 事件流心跳看门狗（隧道下判定「流是否还活着」）。 */
   watchdogTimer: null,
   /** 最近一次收到事件流数据的时间（看门狗用）。 */
@@ -204,12 +209,13 @@ $('btn-logout').addEventListener('click', async () => {
 document.querySelectorAll('.nav-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b === btn));
-    ['grind', 'pkpage', 'practice', 'accounts', 'jobs', 'tunnel', 'admin'].forEach((t) => {
+    ['grind', 'pkpage', 'practice', 'race', 'accounts', 'jobs', 'tunnel', 'admin'].forEach((t) => {
       $('tab-' + t).classList.toggle('hidden', t !== btn.dataset.tab);
     });
     const t = btn.dataset.tab;
     if (t === 'pkpage') { loadPkPage(); }
     if (t === 'practice') { loadPractice(); }
+    if (t === 'race') { restoreRaceJob(); }
     if (t === 'accounts') { loadDeviceChains(); }
     if (t === 'accounts') { loadLeoAccounts(); }
     if (t === 'jobs') { loadJobs(); }
@@ -323,6 +329,7 @@ async function loadLeoAccounts() {
   // 批量开任务的多选列表（刷局 / 刷练习各一份，共用同一批账号）
   renderBatchPicker('grind-batch', r.accounts, batchSel.grind);
   renderBatchPicker('prac-batch', r.accounts, batchSel.prac);
+  fillRaceLeo(r.accounts);
   await loadSubsForSelectedLeo();
 }
 
@@ -973,11 +980,12 @@ function isActiveJob(j) {
 }
 
 function kindText(j) {
-  return j.kind === 'exercise' ? '刷练习' : '刷局';
+  if (j.kind === 'exercise') return '刷练习';
+  if (j.kind === 'race') return '竞速';
+  return '刷局';
 }
-
 /**
- * 把任务的完整参数拼成人能读的一段文字（刷局与刷练习字段不同，分两路拼）。
+ * 把任务的完整参数拼成人能读的一段文字（刷局 / 刷练习 / 竞速字段不同，分三路拼）。
  */
 function jobConfigText(j) {
   const c = j.config || {};
@@ -985,7 +993,15 @@ function jobConfigText(j) {
     '任务类型：' + kindText(j),
     '轮次：' + (j.roundsDone || 0) + '/' + (j.roundsTotal || 0) + '（失败 ' + (j.roundsFailed || 0) + '）',
   ];
-  if (j.kind === 'exercise') {
+  if (j.kind === 'race') {
+    head.push(
+      '知识点 ID：' + (c.pointId || '自动（第一个）'),
+      '题数：' + (c.questionCount ? c.questionCount + ' 题' : '默认'),
+      '提交时间：' + (c.answerDelayMinMs || 0) + '~' + (c.answerDelayMaxMs || 0) + 'ms',
+      '答案来源：' + (c.useSample === false ? '本地计算优先' : '抄 sample'),
+      '局间间隔：' + (c.gapMinMs || 0) + '~' + (c.gapMaxMs || 0) + 'ms',
+    );
+  } else if (j.kind === 'exercise') {
     head.push(
       '知识点 ID：' + c.keypointId,
       '每轮题数：' + c.limit,
@@ -1032,6 +1048,23 @@ $('prac-pump').addEventListener('click', pumpPractice);
 $('prac-exam').addEventListener('click', fetchPracticeExam);
 $('prac-run').addEventListener('click', runPractice);
 $('prac-stop').addEventListener('click', stopPractice);
+
+/* ---- 比赛竞速（开学季） ---- */
+$('race-home').addEventListener('click', loadRaceHome);
+$('race-rank-load').addEventListener('click', loadRaceRank);
+$('race-run').addEventListener('click', runRace);
+$('race-stop').addEventListener('click', stopRace);
+$('race-presets').addEventListener('click', () => {
+  // 「填入推荐值」：竞赛模式（秒答）
+  $('race-delaymin').value = '0';
+  $('race-delaymax').value = '0';
+  $('race-qcount').value = '0';
+  $('race-rounds').value = '10';
+  $('race-gapmin').value = '800';
+  $('race-gapmax').value = '1500';
+  $('race-battlemax').value = '300000';
+  toast('已填入推荐值：秒答 + 10 局 + 局间 0.8~1.5s', 'ok');
+});
 
 /**
  * 「填入推荐值」：把刷局节奏一键填成惯用配置（每轮 0、答题 8~12s、
@@ -1765,6 +1798,241 @@ function restorePracticeJob() {
   $('prac-stop').disabled = false;
   setPracticeHint('正在显示任务 #' + saved + ' 的日志（若是历史任务，这里显示的是回放）。', true);
 }
+/* ========================= 开学季竞速（比赛逆向接口提交对局） =========================
+ *
+ * 纯 Node 直连复刻「匹配 → 对战 → 提交」；前端只负责
+ *  - 拉活动主页（知识点下拉 + 活动时间）
+ *  - 拉榜单（全国/城市）
+ *  - 起后台任务（kind='race'）+ 订阅日志流
+ */
+
+/** 把账号填进竞速页下拉（loadLeoAccounts 里调用）。 */
+function fillRaceLeo(accounts) {
+  const sel = $('race-leo');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '';
+  if (!accounts.length) {
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = '（尚未导入小猿账号）';
+    sel.appendChild(o);
+    return;
+  }
+  for (const a of accounts) {
+    const o = document.createElement('option');
+    o.value = String(a.id);
+    o.textContent = a.name + '（uid ' + (a.yfdU || '?') + '）';
+    sel.appendChild(o);
+  }
+  if (prev && accounts.some((a) => String(a.id) === prev)) sel.value = prev;
+}
+
+/** 「获取知识点」：拉活动主页，填知识点下拉 + 状态。 */
+async function loadRaceHome() {
+  const id = $('race-leo').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  const box = $('race-home-status');
+  box.textContent = '拉取中…';
+  try {
+    const r = await api('/api/race/home?leoAccountId=' + encodeURIComponent(id));
+    if (!r.ok) {
+      box.textContent = '失败：HTTP ' + r.status + '\n' + (r.text || '');
+      return toast('获取知识点失败', 'err');
+    }
+    state.raceHome = r.home;
+    const sel = $('race-point');
+    sel.innerHTML = '';
+    const pts = (r.home && r.home.points) || [];
+    for (const p of pts) {
+      const o = document.createElement('option');
+      o.value = String(p.pointId);
+      o.textContent = p.pointName + '（' + p.pointId + '，' + (p.expectedQuestionCnt || '?') + ' 题）';
+      sel.appendChild(o);
+    }
+    if (!pts.length) {
+      const o = document.createElement('option');
+      o.value = '0';
+      o.textContent = '（活动无知识点）';
+      sel.appendChild(o);
+    }
+    const ended = r.home && r.home.activityEndTime && Date.now() > r.home.activityEndTime;
+    box.textContent = [
+      '活动 sessionId：' + ((r.home && r.home.gameSessionId) || '?'),
+      '活动时间：' + (r.home && r.home.activityStartTime ? new Date(r.home.activityStartTime).toLocaleString() : '?') +
+        ' ~ ' + (r.home && r.home.activityEndTime ? new Date(r.home.activityEndTime).toLocaleString() : '?') +
+        (ended ? '（已结束）' : '（进行中）'),
+      '知识点：' + pts.map((p) => p.pointName).join('、'),
+      '玩家：' + ((r.home && r.home.player && r.home.player.name) || '?') +
+        '（已完成 ' + ((r.home && r.home.user && r.home.user.finishCount) || 0) + ' 局）',
+    ].join('\n');
+    toast('知识点已更新（' + pts.length + ' 个）', 'ok');
+  } catch (e) {
+    box.textContent = '失败：' + e.message;
+    toast(e.message, 'err');
+  }
+}
+
+/** 「拉取榜单」。 */
+async function loadRaceRank() {
+  const id = $('race-leo').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  const pointId = Number($('race-point').value || 0);
+  if (!pointId) return toast('先点「获取知识点」选一个知识点', 'err');
+  const box = $('race-rank-log');
+  box.textContent = '拉取中…';
+  const scope = Number($('race-rank-scope').value || 1);
+  let qs = '/api/race/rank?leoAccountId=' + encodeURIComponent(id) +
+    '&pointId=' + encodeURIComponent(pointId) + '&scope=' + scope;
+  const lat = $('race-rank-lat').value;
+  const lng = $('race-rank-lng').value;
+  if (scope === 2) {
+    if (!lat || !lng) return toast('城市榜需要填纬度/经度', 'err');
+    qs += '&lat=' + encodeURIComponent(lat) + '&lng=' + encodeURIComponent(lng);
+  }
+  try {
+    const r = await api(qs);
+    if (!r.ok) {
+      box.textContent = '失败：HTTP ' + r.status + '\n' + (r.text || '');
+      return toast('榜单拉取失败', 'err');
+    }
+    const d = r.rank || {};
+    const lines = [];
+    lines.push('范围：' + (d.scope === 2 ? '城市' : '全国') + '（' + (d.regionName || '?') + '）');
+    lines.push('知识点：' + (d.curPointName || '?'));
+    if (d.self) {
+      lines.push('我的：名次 ' + (d.self.rank == null ? '?' : d.self.rank) +
+        '，costTime ' + (d.self.costTime == null ? '?' : d.self.costTime + 'ms') +
+        '，与上名差 ' + (d.self.gapCostTime == null ? '?' : d.self.gapCostTime + 'ms'));
+    }
+    lines.push('—— 榜单前 20 ——');
+    const ranks = Array.isArray(d.ranks) ? d.ranks.slice(0, 20) : [];
+    for (const it of ranks) {
+      lines.push('#' + it.rank + '  ' + ((it.player && it.player.name) || '?') +
+        '  costTime=' + (it.costTime == null ? '?' : it.costTime + 'ms') +
+        (it.self ? '  ← 我' : ''));
+    }
+    if (!ranks.length) lines.push('（榜单为空）');
+    box.textContent = lines.join('\n');
+    toast('榜单已更新', 'ok');
+  } catch (e) {
+    box.textContent = '失败：' + e.message;
+    toast(e.message, 'err');
+  }
+}
+
+/** 「开始竞速」：起后台任务 + 订阅日志流。 */
+async function runRace() {
+  const id = $('race-leo').value;
+  if (!id) return toast('先选择小猿账号', 'err');
+  const log = $('race-runlog');
+  log.textContent = '';
+  const say = (s, cls) => logLine(log, s, cls);
+  stopRaceStream();
+  const useSample = document.querySelector('input[name="raceUseSample"]:checked');
+  try {
+    const r = await api('/api/race/run', {
+      method: 'POST',
+      body: {
+        leoAccountId: Number(id),
+        pointId: Number($('race-point').value || 0),
+        questionCount: Number($('race-qcount').value || 0),
+        grade: Number($('race-grade').value || 0),
+        rounds: Number($('race-rounds').value || 1),
+        answerDelayMinMs: Number($('race-delaymin').value || 0),
+        answerDelayMaxMs: Number($('race-delaymax').value || 0),
+        gapMinMs: Number($('race-gapmin').value || 0),
+        gapMaxMs: Number($('race-gapmax').value || 0),
+        battleMaxMs: Number($('race-battlemax').value || 300000),
+        useSample: !useSample || useSample.value === '1',
+      },
+    });
+    state.raceJobId = r.jobId;
+    try { localStorage.setItem('pknode.raceJobId', String(r.jobId)); } catch (e) { /* ignore */ }
+    setRaceHint(r.message || ('任务 #' + r.jobId + ' 已开始'), true);
+    say(r.message || '已开始', 'l-ok');
+    $('race-stop').disabled = false;
+    attachRaceStream();
+    loadJobs();
+  } catch (e) {
+    say('启动失败：' + e.message, 'l-warn');
+    toast(e.message, 'err');
+  }
+}
+
+/** 顶部提示行。 */
+function setRaceHint(text, ok) {
+  const el = $('race-runhint');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = ok ? 'var(--ok)' : 'var(--danger)';
+}
+
+/** 停止竞速任务（立即中断）。 */
+async function stopRace() {
+  const jobId = state.raceJobId;
+  if (!jobId) return toast('没有正在看的竞速任务', 'err');
+  const btn = $('race-stop');
+  btn.disabled = true;
+  btn.textContent = '正在中断…';
+  try {
+    const r = await api('/api/jobs/' + jobId + '/stop', { method: 'POST', body: { immediate: true } });
+    toast(r.message || '已停止', 'ok');
+  } catch (e) {
+    toast(e.message, 'err');
+    btn.disabled = false;
+  }
+  btn.textContent = '停止';
+}
+
+/** 竞速事件渲染。 */
+function renderRaceEvent(d, log) {
+  let cls = '';
+  if (d.type === 'ss-ack-ok' || d.type === 'ok' || d.type === 'ss-finish' || d.type === 'ss-detail-ok') cls = 'l-ok';
+  else if (d.type === 'ss-warn' || d.type === 'fail' || d.type === 'ss-gate') cls = 'l-warn';
+  else if (d.type === 'ss-round' || d.type === 'ss-gap' || d.type === 'ss-countdown') cls = 'l-dim';
+  logLine(log, (d.message || d.type), cls);
+  if (d.finished) {
+    $('race-stop').disabled = true;
+    setRaceHint(d.message || '竞速任务已结束', true);
+    loadJobs();
+  }
+}
+
+/** 订阅竞速事件流（服务端镜像到 raceMirror 通道）。 */
+function attachRaceStream() {
+  stopRaceStream();
+  const log = $('race-runlog');
+  const jobId = state.raceJobId;
+  const es = new EventSource('/api/race/stream');
+  state.raceStream = es;
+  es.onopen = () => logLine(log, '[已连接竞速日志流…]', 'l-dim');
+  es.onmessage = (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (jobId && d.jobId != null && Number(d.jobId) !== Number(jobId)) return;
+    renderRaceEvent(d, log);
+  };
+  es.onerror = () => { /* EventSource 自动重连 */ };
+}
+
+/** 关闭竞速事件流。 */
+function stopRaceStream() {
+  if (state.raceStream) { state.raceStream.close(); state.raceStream = null; }
+}
+
+/** 回到竞速页时恢复上次的任务视图。 */
+function restoreRaceJob() {
+  if (state.raceJobId) { attachRaceStream(); return; }
+  let saved = null;
+  try { saved = localStorage.getItem('pknode.raceJobId'); } catch (e) { /* ignore */ }
+  if (!saved) return;
+  state.raceJobId = Number(saved);
+  attachRaceStream();
+  $('race-stop').disabled = false;
+  setRaceHint('正在显示任务 #' + saved + ' 的日志（若是历史任务，这里显示的是回放）。', true);
+}
+
 /* ========================= 设备链池 ========================= */
 async function loadDeviceChains() {
   try {
@@ -1877,6 +2145,10 @@ const PERSIST_IDS = [
   // 刷练习
   'prac-kp', 'prac-limit', 'prac-rounds', 'prac-gapmin', 'prac-gapmax',
   'prac-delta', 'prac-rts',
+  // 开学季竞速
+  'race-delaymin', 'race-delaymax', 'race-qcount', 'race-grade', 'race-rounds',
+  'race-gapmin', 'race-gapmax', 'race-battlemax', 'race-rank-scope',
+  'race-rank-lat', 'race-rank-lng',
 ];
 
 function bindPersist() {
